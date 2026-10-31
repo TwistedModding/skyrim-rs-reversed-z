@@ -4,6 +4,7 @@
 //! depth the world targets hold is then 1 - the vanilla value. Their standard copies
 //! ([`crate::copy`]) are refreshed when a written world view is unbound (readers cannot sample a
 //! depth target bound for writing) and after the engine copies the scene depth into another target.
+//! The twins' far push is scaled for the near plane ([`send_push_scale`]).
 
 use core::ffi::c_void;
 use std::collections::HashMap;
@@ -12,11 +13,12 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering}
 
 use sre::raw::globals;
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11_COMPARISON_FUNC, D3D11_COMPARISON_GREATER, D3D11_COMPARISON_GREATER_EQUAL,
-    D3D11_COMPARISON_LESS, D3D11_COMPARISON_LESS_EQUAL, D3D11_DEPTH_STENCIL_DESC,
-    D3D11_DEPTH_STENCIL_VIEW_DESC, D3D11_DEPTH_WRITE_MASK_ALL, D3D11_RASTERIZER_DESC,
-    D3D11_VIEWPORT, ID3D11DepthStencilState, ID3D11DepthStencilView, ID3D11Device,
-    ID3D11DeviceContext, ID3D11RasterizerState, ID3D11RenderTargetView, ID3D11VertexShader,
+    D3D11_BIND_CONSTANT_BUFFER, D3D11_BUFFER_DESC, D3D11_COMPARISON_FUNC, D3D11_COMPARISON_GREATER,
+    D3D11_COMPARISON_GREATER_EQUAL, D3D11_COMPARISON_LESS, D3D11_COMPARISON_LESS_EQUAL,
+    D3D11_DEPTH_STENCIL_DESC, D3D11_DEPTH_STENCIL_VIEW_DESC, D3D11_DEPTH_WRITE_MASK_ALL,
+    D3D11_RASTERIZER_DESC, D3D11_USAGE_DEFAULT, D3D11_VIEWPORT, ID3D11Buffer,
+    ID3D11DepthStencilState, ID3D11DepthStencilView, ID3D11Device, ID3D11DeviceContext,
+    ID3D11RasterizerState, ID3D11RenderTargetView, ID3D11VertexShader,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
 use windows::core::Interface;
@@ -60,6 +62,8 @@ const RECORD_SHADER: usize = 0x8;
 const RECORD_SIZE: usize = 0x10;
 const RECORD_BYTECODE: usize = 0x68;
 const D3D11_CLEAR_DEPTH: u32 = 1;
+/// The near plane the engine's far push was made for.
+const VANILLA_NEAR: f32 = 15.0;
 const KEEP_TARGETS: u32 = 0xffff_ffff;
 
 macro_rules! hooks {
@@ -124,6 +128,8 @@ static MIRRORED_RASTER: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
 static DEPTH_WRITES: Mutex<Option<HashMap<usize, bool>>> = Mutex::new(None);
 static VERTEX_TWINS: Mutex<Option<HashMap<usize, Option<ID3D11VertexShader>>>> = Mutex::new(None);
 static TWINS_FAILED: AtomicU64 = AtomicU64::new(0);
+static PUSH_SCALE: Mutex<Option<ID3D11Buffer>> = Mutex::new(None);
+static PUSH_SCALE_SENT: AtomicU32 = AtomicU32::new(0);
 static CLEARS: AtomicU64 = AtomicU64::new(0);
 
 fn original<F: Copy>(slot: &Mutex<Option<hook::Hook<F>>>) -> F {
@@ -225,6 +231,9 @@ fn bind(context: *mut c_void, view: *mut c_void) {
     if BOUND.swap(bound, Ordering::Relaxed) == bound {
         return;
     }
+    if bound {
+        send_push_scale(context);
+    }
     unsafe {
         original(&SET_DEPTH_STATE)(
             context,
@@ -248,6 +257,41 @@ fn bind(context: *mut c_void, view: *mut c_void) {
             0,
         );
     }
+}
+
+/// Binds near / 15 for the twins to scale the far push by. The push adds 0.5 clip units to depth
+/// past 70,000, about 0.5 z / near in distance; scaled, it moves far surfaces as far at any near
+/// as at the engine's 15.
+fn send_push_scale(context: *mut c_void) {
+    let Some(context) = (unsafe { ID3D11DeviceContext::from_raw_borrowed(&context) }) else {
+        return;
+    };
+    let near = skyrim::render::depth_shift_near();
+    let scale = if near > 0.0 { near / VANILLA_NEAR } else { 1.0 };
+    let mut buffer = PUSH_SCALE.lock().unwrap();
+    if buffer.is_none() {
+        let desc = D3D11_BUFFER_DESC {
+            ByteWidth: 16,
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32,
+            ..Default::default()
+        };
+        let Some(device) = device() else { return };
+        if unsafe { device.CreateBuffer(&raw const desc, None, Some(&raw mut *buffer)) }.is_err() {
+            return;
+        }
+        PUSH_SCALE_SENT.store(0, Ordering::Relaxed);
+    }
+    let Some(b) = buffer.as_ref() else { return };
+    if PUSH_SCALE_SENT.swap(scale.to_bits(), Ordering::Relaxed) != scale.to_bits() {
+        let data = [scale, 0.0, 0.0, 0.0];
+        unsafe { context.UpdateSubresource(b, 0, None, data.as_ptr().cast(), 0, 0) };
+    }
+    unsafe { context.VSSetConstantBuffers(crate::twin::PUSH_SCALE_SLOT, Some(&[Some(b.clone())])) };
+}
+
+pub(crate) fn release_push_scale() {
+    PUSH_SCALE.lock().unwrap().take();
 }
 
 /// Runs `f` with no output targets bound, past the bind bookkeeping, and binds them again after.

@@ -120,6 +120,7 @@ fn engage() {
 fn unload() {
     READY.store(false, Ordering::Release);
     context::remove();
+    context::release_push_scale();
     copy::release();
 }
 

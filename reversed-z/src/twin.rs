@@ -1,24 +1,33 @@
 //! The mirrored twin of a vertex shader (DXBC, shader model 5): the same program with the position's
 //! z replaced by w - z. Every write of the position goes to a temp and the shader ends by writing it
-//! out. Where clip z comes from matrix rows, the instructions that compute it are also copied in
-//! front of each original into fresh temps, reading `w_row - z_row` for the z row, so far depth
-//! keeps its precision while every other use of clip z (fog, the far push) keeps the standard value.
-//! Otherwise (screen quads, constant depth, the sky's z = w) the shader ends with z = w - z.
+//! out. Where clip z comes from matrix rows, the twin ends with w - z computed from w and the
+//! projection's z row instead (`cb12[6]` = (0, 0, A, -A near)): A near - (A - 1) w. Clip z itself is
+//! a float near the distance, so its rounding alone moves a far surface by about ulp(z) z / near;
+//! from w that rounding is scaled by A - 1 (about near / far) and far surfaces keep their order at
+//! any near. The far push the engine adds after clip z is carried over, scaled by `cb13[0].x`
+//! ([`PUSH_SCALE_SLOT`]), which the context sets to near / 15. Otherwise (screen quads, constant
+//! depth, the sky's z = w) the shader ends with z = w - z.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 const ADD: u32 = 0;
+const AND: u32 = 1;
+const DIV: u32 = 14;
 const DP2: u32 = 15;
 const DP3: u32 = 16;
 const DP4: u32 = 17;
+const LT: u32 = 49;
 const MAD: u32 = 50;
 const MIN: u32 = 51;
 const MAX: u32 = 52;
 const CUSTOM_DATA: u32 = 53;
 const MOV: u32 = 54;
+const MOVC: u32 = 55;
 const MUL: u32 = 56;
 const RET: u32 = 62;
 const RETC: u32 = 63;
+const DCL_CONSTANT_BUFFER: u32 = 89;
+const DCL_GLOBAL_FLAGS: u32 = 106;
 const DCL_OUTPUT_SIV: u32 = 103;
 const DCL_TEMPS: u32 = 104;
 const DECLARATIONS: core::ops::RangeInclusive<u32> = 0x58..=0x6b;
@@ -35,6 +44,14 @@ const NEGATE: u32 = 1 | (1 << 6);
 const EXTENDED: u32 = 1 << 31;
 const XYZW: [u8; 4] = [0, 1, 2, 3];
 const CB_XYZW: u32 = 2 | (1 << 2) | (0xe4 << 4) | (CONSTANT_BUFFER << 12) | (2 << 20);
+const IMMEDIATE_SCALAR: u32 = 1 | (IMMEDIATE32 << 12);
+
+/// The vertex constant buffer slot the far push's scale is read from; no engine shader declares it.
+pub(crate) const PUSH_SCALE_SLOT: u32 = 13;
+/// The engine's per-frame constants (`UploadPerFrameConstants`): the camera's projection rows at 4..7.
+const PER_FRAME_SLOT: u32 = 12;
+const PROJECTION_Z: u32 = 6;
+const PROJECTION_W: u32 = 7;
 
 #[derive(Clone)]
 struct Operand {
@@ -168,7 +185,10 @@ fn decode(tok: &[u32]) -> Option<Vec<Instruction>> {
 }
 
 fn component_wise(op: u32) -> bool {
-    matches!(op, ADD | MAD | MIN | MAX | MOV | MUL)
+    matches!(
+        op,
+        ADD | AND | DIV | LT | MAD | MIN | MAX | MOV | MOVC | MUL
+    )
 }
 
 fn dot_width(op: u32) -> Option<usize> {
@@ -180,11 +200,13 @@ fn dot_width(op: u32) -> Option<usize> {
     }
 }
 
-/// The source components an instruction reads to produce destination component `c`.
+/// The source components an instruction reads to produce destination component `c`; all of them for
+/// an instruction not known to work per component.
 fn read_components(op: u32, s: &Operand, c: u8) -> Vec<u8> {
     match dot_width(op) {
         Some(n) => s.swizzle[..n].to_vec(),
-        None => vec![s.swizzle[c as usize]],
+        None if component_wise(op) => vec![s.swizzle[c as usize]],
+        None => s.swizzle.to_vec(),
     }
 }
 
@@ -210,6 +232,16 @@ fn reg(kind: u32, index: u32, mask: Option<u8>, swizzle: [u8; 4], negated: bool)
         vec![t | EXTENDED, NEGATE, index]
     } else {
         vec![t, index]
+    }
+}
+
+/// Component `c` of element `element` of constant buffer `slot`, replicated.
+fn cb(slot: u32, element: u32, c: u8, negated: bool) -> Vec<u32> {
+    let t = (CB_XYZW & !(0xff << 4)) | ((u32::from(c) * 0x55) << 4);
+    if negated {
+        vec![t | EXTENDED, NEGATE, slot, element]
+    } else {
+        vec![t, slot, element]
     }
 }
 
@@ -245,9 +277,6 @@ fn slice(code: &[Instruction], position: u32, comp: u8) -> Option<Slice> {
         if hit == 0 {
             continue;
         }
-        if !component_wise(ins.op) && dot_width(ins.op).is_none() {
-            return None;
-        }
         for c in components(hit) {
             need.remove(&(d.kind, r, c));
         }
@@ -273,43 +302,25 @@ fn slice(code: &[Instruction], position: u32, comp: u8) -> Option<Slice> {
     need.is_empty().then_some((members, rows))
 }
 
-/// What the precise twin adds: instructions before and after given instructions, the temp and
-/// component `z` holding mirrored clip z, and the temps used.
-struct Mirrored {
-    before: HashMap<usize, Vec<u32>>,
-    after: HashMap<usize, Vec<u32>>,
-    z: (u32, u8),
-    extra_temps: u32,
-}
-
-/// Temps past the shader's own: the redirected position, `w_row - z_row`, standard clip z and the
-/// correction, then the copies'.
+/// Temps past the shader's own: the redirected position, and standard clip z with the twin's work.
 const POSITION: u32 = 0;
-const ROWS: u32 = 1;
-const KEPT: u32 = 2;
-const FIRST_COPY: u32 = 3;
+const KEPT: u32 = 1;
 
-/// Fresh temps for the copies, one per original register.
-struct Fresh {
-    first: u32,
-    map: HashMap<(u32, u32), u32>,
-}
-
-impl Fresh {
-    #[allow(clippy::cast_possible_truncation)]
-    fn get(&mut self, key: (u32, u32)) -> u32 {
-        let next = self.first + self.map.len() as u32;
-        *self.map.entry(key).or_insert(next)
+/// The last dot product of position z that depends on the z row of a matrix whose w row position w
+/// reads (standard clip z), and the component it writes.
+fn clip_z(code: &[Instruction], position: u32) -> Option<(usize, u8)> {
+    let (z_slice, z_rows) = slice(code, position, 2)?;
+    let (_, w_rows) = slice(code, position, 3)?;
+    let mut z_only = z_rows.difference(&w_rows);
+    let mut w_only = w_rows.difference(&z_rows);
+    let (Some(&z_row), None, Some(&w_row), None) =
+        (z_only.next(), z_only.next(), w_only.next(), w_only.next())
+    else {
+        return None;
+    };
+    if z_row.0 != w_row.0 {
+        return None;
     }
-}
-
-/// The instructions of the z slice that depend on the z row, up to the last dot product among them
-/// (clip z), and that dot product.
-fn clip_z(
-    code: &[Instruction],
-    z_slice: &BTreeMap<usize, u8>,
-    z_row: (u32, u32),
-) -> Option<(BTreeSet<usize>, usize)> {
     let mut writer: HashMap<(u32, u8), usize> = HashMap::new();
     let mut dependent: BTreeSet<usize> = BTreeSet::new();
     let mut leaf = None;
@@ -329,149 +340,92 @@ fn clip_z(
             if reads_row {
                 dependent.insert(n);
                 if dot_width(ins.op).is_some() && hit.is_power_of_two() {
-                    leaf = Some(n);
+                    leaf = Some((n, components(hit).next()?));
                 }
             }
         }
         record_writes(&mut writer, ins, n);
     }
-    let leaf = leaf?;
-    Some((dependent.range(..=leaf).copied().collect(), leaf))
+    leaf
 }
 
-/// The copy of instruction `ins` writing component mask `hit` to a fresh temp, reading `rows` for
-/// the z row and the fresh temps for values the other copies wrote.
-#[allow(clippy::too_many_arguments, clippy::cast_possible_truncation)]
-fn copy_instruction(
-    tok: &[u32],
-    ins: &Instruction,
-    hit: u8,
-    z_row: (u32, u32),
-    rows: u32,
-    copied: &BTreeSet<usize>,
-    writer: &HashMap<(u32, u8), usize>,
-    fresh: &mut Fresh,
-) -> Option<Vec<u32>> {
-    let d = &ins.operands[0];
-    if d.extended {
-        return None;
-    }
-    let mut body = vec![tok[ins.at] & !(0x7f << 24)];
-    body.extend_from_slice(&tok[ins.at + 1..d.start]);
-    body.push((tok[d.start] & !(0xff << 4) & !(0xff << 12)) | (u32::from(hit) << 4) | (TEMP << 12));
-    body.push(fresh.get((d.kind, d.register()?)));
-    for s in &ins.operands[1..] {
-        let mut t = tok[s.start..s.end].to_vec();
-        if s.element() == Some(z_row) {
-            let mut head = vec![(t[0] & (((1 << 12) - 1) | EXTENDED)) | (TEMP << 12) | (1 << 20)];
-            if s.extended {
-                head.push(t[1]);
-            }
-            head.push(rows);
-            t = head;
-        } else if s.kind == TEMP {
-            let r = s.register()?;
-            let inside: HashSet<bool> = components(hit)
-                .flat_map(|c| read_components(ins.op, s, c))
-                .map(|sc| writer.get(&(r, sc)).is_some_and(|w| copied.contains(w)))
-                .collect();
-            match inside.into_iter().collect::<Vec<_>>().as_slice() {
-                [true] => *t.last_mut()? = fresh.get((TEMP, r)),
-                [false] => {}
-                _ => return None,
-            }
-        }
-        body.extend(t);
-    }
-    body[0] |= (body.len() as u32) << 24;
-    Some(body)
-}
+/// Instructions inserted after given instructions of the program.
+type Inserted = HashMap<usize, Vec<u32>>;
 
-/// Copies, in front of each original, of the instructions that compute clip z (the last dot
-/// product that depends on the z row) with `w_row - z_row` read for the z row, writing fresh temps;
-/// and a copy of standard clip z kept after the original. The shader then ends with
-/// z = mirrored + (standard - final): exact where final is clip z itself, and the far push the
-/// engine adds after it carried over.
-fn mirrored_slice(
-    tok: &[u32],
-    code: &[Instruction],
-    position: u32,
-    base: u32,
-    first: usize,
-) -> Option<Mirrored> {
-    let (z_slice, z_rows) = slice(code, position, 2)?;
-    let (_, w_rows) = slice(code, position, 3)?;
-    let mut z_only = z_rows.difference(&w_rows);
-    let mut w_only = w_rows.difference(&z_rows);
-    let (Some(&z_row), None, Some(&w_row), None) =
-        (z_only.next(), z_only.next(), w_only.next(), w_only.next())
-    else {
-        return None;
-    };
-    if z_row.0 != w_row.0 {
-        return None;
-    }
-    let (copied, leaf) = clip_z(code, &z_slice, z_row)?;
-
-    let mut fresh = Fresh {
-        first: base + FIRST_COPY,
-        map: HashMap::new(),
-    };
-    let mut before: HashMap<usize, Vec<u32>> = HashMap::new();
-    before.insert(
-        first,
-        instruction(
-            ADD,
-            &[
-                &reg(TEMP, base + ROWS, Some(0xf), XYZW, false),
-                &[CB_XYZW, w_row.0, w_row.1],
-                &[CB_XYZW | EXTENDED, NEGATE, z_row.0, z_row.1],
-            ],
-        ),
-    );
-    let mut writer: HashMap<(u32, u8), usize> = HashMap::new();
-    for (n, ins) in code.iter().enumerate() {
-        if copied.contains(&n) {
-            let copy = copy_instruction(
-                tok,
-                ins,
-                z_slice[&n],
-                z_row,
-                base + ROWS,
-                &copied,
-                &writer,
-                &mut fresh,
-            )?;
-            before.entry(n).or_default().extend(copy);
-        }
-        record_writes(&mut writer, ins, n);
-    }
+/// The precise twin's additions: standard clip z kept in `KEPT.x` after the instruction that computes
+/// it, and the ending: the far push, scaled, and z = w - z from w, or from standard z where the
+/// projection's w row is (0, 0, 0, 1) (orthographic).
+fn precise(code: &[Instruction], position: u32, base: u32) -> Option<(Inserted, Vec<u32>)> {
+    let (leaf, c) = clip_z(code, position)?;
     let d = &code[leaf].operands[0];
-    let c = components(z_slice[&leaf]).next()?;
     let standard = if d.kind == OUTPUT {
         base + POSITION
     } else {
         d.register()?
     };
+    let temp = |r: u32, c: u8, negated: bool| reg(TEMP, base + r, None, [c; 4], negated);
+    let kept = |c: u8| reg(TEMP, base + KEPT, Some(1 << c), XYZW, false);
     let after = HashMap::from([(
         leaf,
-        instruction(
-            MOV,
-            &[
-                &reg(TEMP, base + KEPT, Some(0b0001), XYZW, false),
-                &reg(TEMP, standard, None, [c; 4], false),
+        instruction(MOV, &[&kept(0), &reg(TEMP, standard, None, [c; 4], false)]),
+    )]);
+    let mut out = Vec::new();
+    for (op, operands) in [
+        (
+            ADD,
+            vec![kept(1), temp(KEPT, 0, false), temp(POSITION, 2, true)],
+        ),
+        (
+            MUL,
+            vec![
+                kept(1),
+                temp(KEPT, 1, false),
+                cb(PUSH_SCALE_SLOT, 0, 0, false),
             ],
         ),
-    )]);
-    let z = (fresh.get((d.kind, d.register()?)), c);
-    #[allow(clippy::cast_possible_truncation)]
-    let extra_temps = FIRST_COPY + fresh.map.len() as u32;
-    Some(Mirrored {
-        before,
-        after,
-        z,
-        extra_temps,
-    })
+        (
+            ADD,
+            vec![kept(3), temp(POSITION, 3, false), temp(KEPT, 0, true)],
+        ),
+        (
+            ADD,
+            vec![
+                kept(2),
+                cb(PER_FRAME_SLOT, PROJECTION_Z, 2, false),
+                vec![IMMEDIATE_SCALAR, (-1.0f32).to_bits()],
+            ],
+        ),
+        (
+            MAD,
+            vec![
+                kept(2),
+                temp(KEPT, 2, true),
+                temp(POSITION, 3, false),
+                cb(PER_FRAME_SLOT, PROJECTION_Z, 3, true),
+            ],
+        ),
+        (
+            MOVC,
+            vec![
+                kept(2),
+                cb(PER_FRAME_SLOT, PROJECTION_W, 3, false),
+                temp(KEPT, 3, false),
+                temp(KEPT, 2, false),
+            ],
+        ),
+        (
+            ADD,
+            vec![
+                reg(OUTPUT, position, Some(0b0100), XYZW, false),
+                temp(KEPT, 2, false),
+                temp(KEPT, 1, false),
+            ],
+        ),
+    ] {
+        let operands: Vec<&[u32]> = operands.iter().map(Vec::as_slice).collect();
+        out.extend(instruction(op, &operands));
+    }
+    Some((after, out))
 }
 
 fn record_writes(writer: &mut HashMap<(u32, u8), usize>, ins: &Instruction, n: usize) {
@@ -566,25 +520,9 @@ pub(crate) fn mirrored(container: &[u8]) -> Option<Vec<u8>> {
             &reg(TEMP, base + POSITION, None, XYZW, false),
         ],
     );
-    let (before, after, extra) = if let Some(m) = mirrored_slice(&tok, &code, position, base, first)
-    {
-        tail.extend(instruction(
-            ADD,
-            &[
-                &reg(TEMP, base + KEPT, Some(0b0010), XYZW, false),
-                &temp(KEPT, 0, false),
-                &temp(POSITION, 2, true),
-            ],
-        ));
-        tail.extend(instruction(
-            ADD,
-            &[
-                &position_out(0b0100),
-                &reg(TEMP, m.z.0, None, [m.z.1; 4], false),
-                &temp(KEPT, 1, false),
-            ],
-        ));
-        (m.before, m.after, m.extra_temps)
+    let after = if let Some((after, ending)) = precise(&code, position, base) {
+        tail.extend(ending);
+        after
     } else {
         tail.extend(instruction(
             ADD,
@@ -594,15 +532,36 @@ pub(crate) fn mirrored(container: &[u8]) -> Option<Vec<u8>> {
                 &temp(POSITION, 2, true),
             ],
         ));
-        (HashMap::new(), HashMap::new(), 1)
+        HashMap::new()
     };
+    let extra = if after.is_empty() { 1 } else { 2 };
 
+    // the push scale's and the per-frame buffers, declared after the shader's own (the per-frame one
+    // grown to the projection rows); the w - z ending reads neither
+    let mut declared = after.is_empty();
+    let mut per_frame_declared = false;
     let mut out = tok[..2].to_vec();
     for (n, ins) in code.iter().enumerate() {
+        let mut body = tok[ins.at..ins.at + ins.len].to_vec();
+        if !declared && ins.op == DCL_CONSTANT_BUFFER && ins.len == 4 && body[2] == PER_FRAME_SLOT {
+            body[3] = body[3].max(PROJECTION_W + 1);
+            per_frame_declared = true;
+        }
+        if !declared && ins.op != DCL_GLOBAL_FLAGS && ins.op != DCL_CONSTANT_BUFFER {
+            out.extend([DCL_CONSTANT_BUFFER | (4 << 24), CB_XYZW, PUSH_SCALE_SLOT, 1]);
+            if !per_frame_declared {
+                out.extend([
+                    DCL_CONSTANT_BUFFER | (4 << 24),
+                    CB_XYZW,
+                    PER_FRAME_SLOT,
+                    PROJECTION_W + 1,
+                ]);
+            }
+            declared = true;
+        }
         if temps.is_none() && n == first {
             out.extend([DCL_TEMPS | (2 << 24), extra]);
         }
-        let mut body = tok[ins.at..ins.at + ins.len].to_vec();
         if ins.op == DCL_TEMPS {
             body[1] = base + extra;
         }
@@ -617,9 +576,6 @@ pub(crate) fn mirrored(container: &[u8]) -> Option<Vec<u8>> {
             let r = s.start - ins.at;
             body[r] = (body[r] & !(0xff << 12)) | (TEMP << 12);
             body[s.end - ins.at - 1] = base + POSITION;
-        }
-        if let Some(b) = before.get(&n) {
-            out.extend(b);
         }
         if ins.op == RET {
             out.extend(&tail);
@@ -713,6 +669,14 @@ mod tests {
             o.z += 0.5 * saturate((o.z - 70000.0) * 0.0001);\n\
             return o;\n\
         }\n";
+    /// The rows read through a position z adjusted with a comparison and a select first.
+    const ADJUSTED: &str = "cbuffer view : register(b2) { float4 rows[4]; float4 band; }\n\
+        float4 main(float4 p : POSITION) : SV_Position {\n\
+            if (abs(p.x - band.x) < band.y) p.z -= p.w / 1000000000.0 + 230.0;\n\
+            float4 o = float4(dot(rows[0], p), dot(rows[1], p), dot(rows[2], p), dot(rows[3], p));\n\
+            o.z += 0.5 * saturate((o.z - 70000.0) * 0.0001);\n\
+            return o;\n\
+        }\n";
     const CONSTANT: &str =
         "float4 main(float4 p : POSITION) : SV_Position { return float4(p.xy, 0.25, 1.0); }\n";
 
@@ -759,12 +723,26 @@ mod tests {
     #[test]
     fn clip_z_from_the_rows() {
         let twin = text(&super::mirrored(&compile(ROWS)).unwrap());
-        assert!(twin.contains("cb2[3].xyzw, -cb2[2].xyzw"), "{twin}");
+        assert!(twin.contains("dcl_constantbuffer CB12[8]"), "{twin}");
+        assert!(
+            twin.contains("cb12[6].zzzz, l(-1.000000)"),
+            "A - 1 from the projection: {twin}"
+        );
+        assert!(twin.contains("-cb12[6].wwww"), "{twin}");
+        assert!(twin.contains("movc "), "orthographic falls back: {twin}");
         assert!(
             twin.contains("dp3 "),
             "the fog keeps standard clip z: {twin}"
         );
         assert!(twin.contains("add o0.z, r"), "{twin}");
+        assert!(twin.contains("dcl_constantbuffer CB13[1]"), "{twin}");
+        assert!(twin.contains("cb13[0].x"), "the push is scaled: {twin}");
+    }
+
+    #[test]
+    fn adjusted_position_z_from_w() {
+        let twin = text(&super::mirrored(&compile(ADJUSTED)).unwrap());
+        assert!(twin.contains("-cb12[6].wwww"), "{twin}");
     }
 
     #[test]
