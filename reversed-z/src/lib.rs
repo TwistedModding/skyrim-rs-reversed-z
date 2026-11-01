@@ -23,6 +23,7 @@ use sre::raw::fns;
 
 mod context;
 mod copy;
+mod shader;
 mod twin;
 
 framework::plugin! {
@@ -73,6 +74,9 @@ fn load(host: &'static Host) -> bool {
     }
     let _ = HOST.set(host);
     WANTED.store(host.settings().get_or("enabled", true), Ordering::Relaxed);
+    if let Err(e) = shader::install() {
+        log(&format!("replacement shader capture unavailable: {e}"));
+    }
     for (offset, old, new) in FORMAT_PATCHES {
         if let Err(e) = unsafe {
             host.hooks().patch(
@@ -122,6 +126,7 @@ fn unload() {
     context::remove();
     context::release_push_scale();
     copy::release();
+    shader::remove();
 }
 
 /// Runs on the console's thread: the render thread picks the switch up at its next output-target

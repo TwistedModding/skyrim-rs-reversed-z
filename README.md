@@ -20,6 +20,8 @@ Copy the package's `Data` folder over the game's (or install the package with a 
 
 ## Build and package
 
+Community Shaders compatibility is in development. The plugin captures replacement vertex shaders through Direct3D and gives precise twins their own projection constants in an unused buffer slot. This has passed synthetic D3D11 WARP tests; it has not yet been validated in game with Community Shaders or its features.
+
 ```
 git clone --recurse-submodules https://github.com/TwistedModding/skyrim-rs-reversed-z.git
 cargo build --release

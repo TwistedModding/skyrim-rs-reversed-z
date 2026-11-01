@@ -1,11 +1,11 @@
 //! The mirrored twin of a vertex shader (DXBC, shader model 5): the same program with the position's
 //! z replaced by w - z. Every write of the position goes to a temp and the shader ends by writing it
 //! out. Where clip z comes from matrix rows, the twin ends with w - z computed from w and the
-//! projection's z row instead (`cb12[6]` = (0, 0, A, -A near)): A near - (A - 1) w. Clip z itself is
+//! projection's z row instead: A near - (A - 1) w. Clip z itself is
 //! a float near the distance, so its rounding alone moves a far surface by about ulp(z) z / near;
 //! from w that rounding is scaled by A - 1 (about near / far) and far surfaces keep their order at
-//! any near. The far push the engine adds after clip z is carried over, scaled by `cb13[0].x`
-//! ([`PUSH_SCALE_SLOT`]), which the context sets to near / 15. Otherwise (screen quads, constant
+//! any near. The far push the engine adds after clip z is carried over, scaled by near / 15.
+//! An unused constant-buffer slot carries the projection and scale. Otherwise (screen quads, constant
 //! depth, the sky's z = w) the shader ends with z = w - z.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -44,14 +44,11 @@ const NEGATE: u32 = 1 | (1 << 6);
 const EXTENDED: u32 = 1 << 31;
 const XYZW: [u8; 4] = [0, 1, 2, 3];
 const CB_XYZW: u32 = 2 | (1 << 2) | (0xe4 << 4) | (CONSTANT_BUFFER << 12) | (2 << 20);
-const IMMEDIATE_SCALAR: u32 = 1 | (IMMEDIATE32 << 12);
 
-/// The vertex constant buffer slot the far push's scale is read from; no engine shader declares it.
-pub(crate) const PUSH_SCALE_SLOT: u32 = 13;
-/// The engine's per-frame constants (`UploadPerFrameConstants`): the camera's projection rows at 4..7.
-const PER_FRAME_SLOT: u32 = 12;
-const PROJECTION_Z: u32 = 6;
-const PROJECTION_W: u32 = 7;
+pub(crate) struct Mirrored {
+    pub code: Vec<u8>,
+    pub constants: Option<u32>,
+}
 
 #[derive(Clone)]
 struct Operand {
@@ -355,8 +352,14 @@ type Inserted = HashMap<usize, Vec<u32>>;
 /// The precise twin's additions: standard clip z kept in `KEPT.x` after the instruction that computes
 /// it, and the ending: the far push, scaled, and z = w - z from w, or from standard z where the
 /// projection's w row is (0, 0, 0, 1) (orthographic).
-fn precise(code: &[Instruction], position: u32, base: u32) -> Option<(Inserted, Vec<u32>)> {
-    let (leaf, c) = clip_z(code, position)?;
+fn precise(
+    code: &[Instruction],
+    position: u32,
+    base: u32,
+    slot: u32,
+    leaf: usize,
+    c: u8,
+) -> Option<(Inserted, Vec<u32>)> {
     let d = &code[leaf].operands[0];
     let standard = if d.kind == OUTPUT {
         base + POSITION
@@ -377,38 +380,27 @@ fn precise(code: &[Instruction], position: u32, base: u32) -> Option<(Inserted, 
         ),
         (
             MUL,
-            vec![
-                kept(1),
-                temp(KEPT, 1, false),
-                cb(PUSH_SCALE_SLOT, 0, 0, false),
-            ],
+            vec![kept(1), temp(KEPT, 1, false), cb(slot, 0, 0, false)],
         ),
         (
             ADD,
             vec![kept(3), temp(POSITION, 3, false), temp(KEPT, 0, true)],
         ),
-        (
-            ADD,
-            vec![
-                kept(2),
-                cb(PER_FRAME_SLOT, PROJECTION_Z, 2, false),
-                vec![IMMEDIATE_SCALAR, (-1.0f32).to_bits()],
-            ],
-        ),
+        (MOV, vec![kept(2), cb(slot, 0, 1, false)]),
         (
             MAD,
             vec![
                 kept(2),
                 temp(KEPT, 2, true),
                 temp(POSITION, 3, false),
-                cb(PER_FRAME_SLOT, PROJECTION_Z, 3, true),
+                cb(slot, 0, 2, false),
             ],
         ),
         (
             MOVC,
             vec![
                 kept(2),
-                cb(PER_FRAME_SLOT, PROJECTION_W, 3, false),
+                cb(slot, 0, 3, false),
                 temp(KEPT, 3, false),
                 temp(KEPT, 2, false),
             ],
@@ -490,7 +482,7 @@ fn rebuild(container: &[u8], offsets: &[usize], at: usize, old: usize, tok: &[u3
 /// The mirrored twin of vertex shader container `container`, or `None` when it has no position
 /// output or a shape this does not rewrite.
 #[allow(clippy::cast_possible_truncation)]
-pub(crate) fn mirrored(container: &[u8]) -> Option<Vec<u8>> {
+pub(crate) fn mirrored(container: &[u8]) -> Option<Mirrored> {
     let (offsets, at, tok) = program(container)?;
     let code = decode(&tok)?;
     let mut position = None;
@@ -520,7 +512,15 @@ pub(crate) fn mirrored(container: &[u8]) -> Option<Vec<u8>> {
             &reg(TEMP, base + POSITION, None, XYZW, false),
         ],
     );
-    let after = if let Some((after, ending)) = precise(&code, position, base) {
+    let mut constants = None;
+    let after = if let Some((leaf, c)) = clip_z(&code, position) {
+        let slot = (0..14).rev().find(|&slot| {
+            !code
+                .iter()
+                .any(|ins| ins.op == DCL_CONSTANT_BUFFER && tok.get(ins.at + 2) == Some(&slot))
+        })?;
+        let (after, ending) = precise(&code, position, base, slot, leaf, c)?;
+        constants = Some(slot);
         tail.extend(ending);
         after
     } else {
@@ -536,27 +536,12 @@ pub(crate) fn mirrored(container: &[u8]) -> Option<Vec<u8>> {
     };
     let extra = if after.is_empty() { 1 } else { 2 };
 
-    // the push scale's and the per-frame buffers, declared after the shader's own (the per-frame one
-    // grown to the projection rows); the w - z ending reads neither
     let mut declared = after.is_empty();
-    let mut per_frame_declared = false;
     let mut out = tok[..2].to_vec();
     for (n, ins) in code.iter().enumerate() {
         let mut body = tok[ins.at..ins.at + ins.len].to_vec();
-        if !declared && ins.op == DCL_CONSTANT_BUFFER && ins.len == 4 && body[2] == PER_FRAME_SLOT {
-            body[3] = body[3].max(PROJECTION_W + 1);
-            per_frame_declared = true;
-        }
         if !declared && ins.op != DCL_GLOBAL_FLAGS && ins.op != DCL_CONSTANT_BUFFER {
-            out.extend([DCL_CONSTANT_BUFFER | (4 << 24), CB_XYZW, PUSH_SCALE_SLOT, 1]);
-            if !per_frame_declared {
-                out.extend([
-                    DCL_CONSTANT_BUFFER | (4 << 24),
-                    CB_XYZW,
-                    PER_FRAME_SLOT,
-                    PROJECTION_W + 1,
-                ]);
-            }
+            out.extend([DCL_CONSTANT_BUFFER | (4 << 24), CB_XYZW, constants?, 1]);
             declared = true;
         }
         if temps.is_none() && n == first {
@@ -586,7 +571,10 @@ pub(crate) fn mirrored(container: &[u8]) -> Option<Vec<u8>> {
         }
     }
     out[1] = out.len() as u32;
-    Some(rebuild(container, &offsets, at, tok.len(), &out))
+    Some(Mirrored {
+        code: rebuild(container, &offsets, at, tok.len(), &out),
+        constants,
+    })
 }
 
 /// The container checksum: MD5 rounds over everything after the checksum, with the bit length
@@ -656,13 +644,14 @@ fn md5_block(state: &mut [u32; 4], block: &[u8; 64]) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+    use std::fmt::Write as _;
     use windows::Win32::Graphics::Direct3D::Fxc::{D3DCompile, D3DDisassemble};
     use windows::Win32::Graphics::Direct3D::ID3DBlob;
     use windows::core::s;
 
     /// Clip position from rows of a constant buffer, fog from its length, and the far push.
-    const ROWS: &str = "cbuffer view : register(b2) { float4 rows[4]; }\n\
+    pub(crate) const ROWS: &str = "cbuffer view : register(b2) { float4 rows[4]; }\n\
         float4 main(float4 p : POSITION, out float fog : FOG) : SV_Position {\n\
             float4 o = float4(dot(rows[0], p), dot(rows[1], p), dot(rows[2], p), dot(rows[3], p));\n\
             fog = length(o.xyz);\n\
@@ -677,7 +666,7 @@ mod tests {
             o.z += 0.5 * saturate((o.z - 70000.0) * 0.0001);\n\
             return o;\n\
         }\n";
-    const CONSTANT: &str =
+    pub(crate) const CONSTANT: &str =
         "float4 main(float4 p : POSITION) : SV_Position { return float4(p.xy, 0.25, 1.0); }\n";
 
     fn bytes(blob: &ID3DBlob) -> Vec<u8> {
@@ -687,7 +676,11 @@ mod tests {
         .to_vec()
     }
 
-    fn compile(source: &str) -> Vec<u8> {
+    pub(crate) fn compile(source: &str) -> Vec<u8> {
+        compile_stage(source, s!("vs_5_0"))
+    }
+
+    pub(crate) fn compile_stage(source: &str, target: windows::core::PCSTR) -> Vec<u8> {
         let mut code = None;
         unsafe {
             D3DCompile(
@@ -697,7 +690,7 @@ mod tests {
                 None,
                 None,
                 s!("main"),
-                s!("vs_5_0"),
+                target,
                 0,
                 0,
                 &raw mut code,
@@ -722,13 +715,15 @@ mod tests {
 
     #[test]
     fn clip_z_from_the_rows() {
-        let twin = text(&super::mirrored(&compile(ROWS)).unwrap());
-        assert!(twin.contains("dcl_constantbuffer CB12[8]"), "{twin}");
+        let rewritten = super::mirrored(&compile(ROWS)).unwrap();
+        assert_eq!(rewritten.constants, Some(13));
+        let twin = text(&rewritten.code);
+        assert!(!twin.contains("CB12["), "{twin}");
         assert!(
-            twin.contains("cb12[6].zzzz, l(-1.000000)"),
-            "A - 1 from the projection: {twin}"
+            twin.contains("cb13[0].yyyy"),
+            "A - 1 from private constants: {twin}"
         );
-        assert!(twin.contains("-cb12[6].wwww"), "{twin}");
+        assert!(twin.contains("cb13[0].zzzz"), "{twin}");
         assert!(twin.contains("movc "), "orthographic falls back: {twin}");
         assert!(
             twin.contains("dp3 "),
@@ -741,14 +736,50 @@ mod tests {
 
     #[test]
     fn adjusted_position_z_from_w() {
-        let twin = text(&super::mirrored(&compile(ADJUSTED)).unwrap());
-        assert!(twin.contains("-cb12[6].wwww"), "{twin}");
+        let twin = text(&super::mirrored(&compile(ADJUSTED)).unwrap().code);
+        assert!(twin.contains("cb13[0].zzzz"), "{twin}");
     }
 
     #[test]
     fn constant_depth_flipped() {
-        let twin = text(&super::mirrored(&compile(CONSTANT)).unwrap());
+        let rewritten = super::mirrored(&compile(CONSTANT)).unwrap();
+        assert_eq!(rewritten.constants, None);
+        let twin = text(&rewritten.code);
         assert!(twin.contains("dcl_temps 1"), "{twin}");
         assert!(twin.contains("add o0.z, r0.wwww, -r0.zzzz"), "{twin}");
+    }
+
+    pub(crate) fn occupied_slots(slots: &[u32]) -> String {
+        let mut source = String::new();
+        let mut extra = String::new();
+        for slot in slots {
+            writeln!(
+                source,
+                "cbuffer extra{slot} : register(b{slot}) {{ float4 value{slot}; }}"
+            )
+            .unwrap();
+            write!(extra, " + value{slot}.x").unwrap();
+        }
+        source + &ROWS.replace("length(o.xyz)", &format!("length(o.xyz){extra}"))
+    }
+
+    #[test]
+    fn occupied_constant_slots_are_preserved() {
+        let source = occupied_slots(&[12, 13]);
+        let rewritten = super::mirrored(&compile(&source)).unwrap();
+        assert_eq!(rewritten.constants, Some(11));
+        let disassembly = text(&rewritten.code);
+        for slot in [11, 12, 13] {
+            assert!(
+                disassembly.contains(&format!("dcl_constantbuffer CB{slot}[1]")),
+                "{disassembly}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_precise_shader_without_a_free_slot_is_refused() {
+        let slots: Vec<u32> = (0..14).filter(|&slot| slot != 2).collect();
+        assert!(super::mirrored(&compile(&occupied_slots(&slots))).is_none());
     }
 }
