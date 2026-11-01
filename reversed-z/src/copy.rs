@@ -1,72 +1,468 @@
-//! 1 - depth of each depth target that holds reversed depth, in a float texture the target's shader
-//! view is swapped for (and that stands in wherever the engine binds the target's own view), so
-//! every reader (shadow masks, SAO, water, soft effects, depth of field, SSR, TAA, the volumetric
-//! apply, the image-space passes) gets the standard depth it was written for.
+//! Conventional-depth views owned by each reversed-depth texture.
 
 use core::ffi::c_void;
 use std::cell::Cell;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
-use windows::Win32::Graphics::Direct3D::ID3DBlob;
+use windows::Win32::Graphics::Direct3D::{D3D_SRV_DIMENSION_TEXTURE2D, ID3DBlob};
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11_BIND_SHADER_RESOURCE, D3D11_BIND_UNORDERED_ACCESS, D3D11_SHADER_MAX_INTERFACES,
-    D3D11_SHADER_RESOURCE_VIEW_DESC, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
-    ID3D11ClassInstance, ID3D11ComputeShader, ID3D11Device, ID3D11DeviceContext,
+    D3D11_BIND_DEPTH_STENCIL, D3D11_BIND_SHADER_RESOURCE, D3D11_BIND_UNORDERED_ACCESS, D3D11_BOX,
+    D3D11_SHADER_MAX_INTERFACES, D3D11_SHADER_RESOURCE_VIEW_DESC,
+    D3D11_SHADER_RESOURCE_VIEW_DESC_0, D3D11_TEX2D_SRV, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
+    ID3D11ClassInstance, ID3D11ComputeShader, ID3D11Device, ID3D11DeviceContext, ID3D11Resource,
     ID3D11ShaderResourceView, ID3D11Texture2D, ID3D11UnorderedAccessView,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_FORMAT_R24_UNORM_X8_TYPELESS, DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS,
+    DXGI_FORMAT_D24_UNORM_S8_UINT, DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_D32_FLOAT_S8X24_UINT,
+    DXGI_FORMAT_R24_UNORM_X8_TYPELESS, DXGI_FORMAT_R24G8_TYPELESS, DXGI_FORMAT_R32_FLOAT,
+    DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS, DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_R32G8X24_TYPELESS,
     DXGI_SAMPLE_DESC,
 };
-use windows::core::{Interface, s};
+use windows::core::{GUID, Interface, s};
 
-use crate::context::{TARGET_SHADER_VIEW, TARGET_TEXTURE, device, immediate, target_field};
-
-/// The depth targets holding reversed depth: the scene depth and the first-person target, drawn
-/// mirrored, and the second scene depth, which the engine copies the scene depth into.
 pub(crate) const REVERSED_TARGETS: [usize; 3] = [0, 1, 7];
-
-const SHADER: &str = "Texture2D<float> depth : register(t0);\nRWTexture2D<float> standard : register(u0);\n[numthreads(8, 8, 1)]\nvoid main(uint3 id : SV_DispatchThreadID) { uint width, height; standard.GetDimensions(width, height); if (id.x < width && id.y < height) standard[id.xy] = 1.0 - depth[id.xy]; }\n";
+const STATE: GUID = GUID::from_u128(0xa232cb36_429b_4650_b548_0c28ca56d252);
+const VIEW: GUID = GUID::from_u128(0x9a2b2bf0_1066_4371_8c77_1fbc938e8d43);
+const TARGET: GUID = GUID::from_u128(0x542f353a_264f_4dfe_8199_74ae282df10f);
+const STANDARD: u32 = 0;
+const DIRTY: u32 = 1;
+const CLEAN: u32 = 2;
+const STANDARD_CLEAN: u32 = 3;
 const GROUP: u32 = 8;
+const SHADER: &str = "Texture2D<float> depth : register(t0);\nRWTexture2D<float> standard : register(u0);\n[numthreads(8, 8, 1)]\nvoid main(uint3 id : SV_DispatchThreadID) { uint width, height; standard.GetDimensions(width, height); if (id.x < width && id.y < height) standard[id.xy] = 1.0 - depth[id.xy]; }\n";
 
 struct Copy {
-    /// Keeps the texture the views are of alive.
-    _standard: ID3D11Texture2D,
+    standard: ID3D11Texture2D,
     view: ID3D11ShaderResourceView,
     target: ID3D11UnorderedAccessView,
-    /// The engine's shader view of the depth target, which its slot holds when not swapped.
     engine_view: ID3D11ShaderResourceView,
     width: u32,
     height: u32,
 }
 
-struct Copies {
-    shader: ID3D11ComputeShader,
-    copies: Vec<Copy>,
+static SHADER_OBJECT: Mutex<Option<ID3D11ComputeShader>> = Mutex::new(None);
+static STANDARD_SHADER_OBJECT: Mutex<Option<ID3D11ComputeShader>> = Mutex::new(None);
+static SEEDS: [AtomicUsize; 3] = [const { AtomicUsize::new(0) }; 3];
+static COUNT: AtomicU64 = AtomicU64::new(0);
+static COPIED: AtomicU64 = AtomicU64::new(0);
+static UNSUPPORTED: AtomicU64 = AtomicU64::new(0);
+thread_local! { static COPYING: Cell<bool> = const { Cell::new(false) }; }
+
+pub(crate) fn internal() -> bool {
+    COPYING.get()
 }
 
-static COPIES: Mutex<Option<Copies>> = Mutex::new(None);
-thread_local! { static COPYING: Cell<bool> = const { Cell::new(false) }; }
-/// While the copies stand in, per target of [`REVERSED_TARGETS`]: the engine's view and the copy's
-/// (atomics, read inside hooks a copy itself triggers while holding `COPIES`).
-static ENGINE_VIEWS: [AtomicUsize; 3] = [const { AtomicUsize::new(0) }; 3];
-static COPY_VIEWS: [AtomicUsize; 3] = [const { AtomicUsize::new(0) }; 3];
-static COUNT: AtomicU64 = AtomicU64::new(0);
+struct Internal(bool);
+impl Internal {
+    fn enter() -> Self {
+        Self(COPYING.replace(true))
+    }
+}
+impl Drop for Internal {
+    fn drop(&mut self) {
+        COPYING.set(self.0);
+    }
+}
+
+fn bytes(blob: &ID3DBlob) -> &[u8] {
+    unsafe {
+        core::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize())
+    }
+}
+
+fn normalize(
+    context: &ID3D11DeviceContext,
+    destination: &ID3D11Resource,
+    inverted: bool,
+) -> Result<(), String> {
+    let standard = refresh(context, destination, None)?;
+    let texture = destination
+        .cast::<ID3D11Texture2D>()
+        .map_err(|e| e.to_string())?;
+    let device = unsafe { texture.GetDevice() }.map_err(|e| e.to_string())?;
+    let mut desc = D3D11_TEXTURE2D_DESC::default();
+    unsafe { texture.GetDesc(&raw mut desc) };
+    if matches!(
+        desc.Format,
+        DXGI_FORMAT_R32_TYPELESS | DXGI_FORMAT_R32_FLOAT | DXGI_FORMAT_D32_FLOAT
+    ) {
+        let _internal = Internal::enter();
+        if inverted {
+            let copy = create_copy(&device, &texture, standard.as_raw())?;
+            let shader = SHADER_OBJECT
+                .lock()
+                .unwrap()
+                .clone()
+                .ok_or("no depth copy shader")?;
+            convert(context, &shader, &copy);
+            unsafe { context.CopyResource(destination, &copy.standard) };
+        } else {
+            let source = unsafe { standard.GetResource() }.map_err(|e| e.to_string())?;
+            unsafe { context.CopyResource(destination, &source) };
+        }
+    } else {
+        return Err("mixed partial copy requires a single-channel float texture".into());
+    }
+    mark(destination, inverted);
+    Ok(())
+}
+
+pub(crate) fn prepare_region(
+    context: &ID3D11DeviceContext,
+    destination: &ID3D11Resource,
+    source: &ID3D11Resource,
+    destination_subresource: u32,
+    offset: [u32; 3],
+    source_box: Option<&D3D11_BOX>,
+) -> Result<(), String> {
+    if !reversed(source) && !reversed(destination) {
+        return Ok(());
+    }
+    let (destination_desc, source_desc) = compatible(destination, source)?;
+    let size = source_box.map_or([source_desc.Width, source_desc.Height, 1], |region| {
+        [
+            region.right.saturating_sub(region.left),
+            region.bottom.saturating_sub(region.top),
+            region.back.saturating_sub(region.front),
+        ]
+    });
+    let complete = destination_subresource == 0
+        && offset == [0; 3]
+        && size == [destination_desc.Width, destination_desc.Height, 1];
+    if (destination_desc.BindFlags | source_desc.BindFlags)
+        & D3D11_BIND_DEPTH_STENCIL.0.cast_unsigned()
+        != 0
+        && (!complete || source_box.is_some())
+    {
+        return Err("depth-stencil copies require a whole subresource".into());
+    }
+    if !complete && reversed(source) != reversed(destination) {
+        normalize(context, destination, reversed(source))?;
+    }
+    Ok(())
+}
 
 pub(crate) fn count() -> u64 {
     COUNT.load(Ordering::Relaxed)
 }
 
-fn create(device: &ID3D11Device, target: usize) -> Result<Copy, String> {
-    let texture =
-        unsafe { *target_field(target, TARGET_TEXTURE).ok_or("no renderer")? } as *mut c_void;
-    let texture = unsafe { ID3D11Texture2D::from_raw_borrowed(&texture) }
-        .ok_or_else(|| format!("no depth texture {target}"))?;
-    let engine_view =
-        unsafe { *target_field(target, TARGET_SHADER_VIEW).ok_or("no renderer")? } as *mut c_void;
-    create_copy(device, texture, engine_view)
+pub(crate) fn initialize(device: &ID3D11Device) -> Result<(), String> {
+    for (slot, invert) in [(&SHADER_OBJECT, true), (&STANDARD_SHADER_OBJECT, false)] {
+        let code = compile(invert)?;
+        let mut shader = None;
+        unsafe { device.CreateComputeShader(bytes(&code), None, Some(&raw mut shader)) }
+            .map_err(|e| format!("depth copy shader: {e}"))?;
+        *slot.lock().unwrap() = Some(shader.ok_or("no depth copy shader")?);
+    }
+    Ok(())
+}
+
+pub(crate) fn sync_sources() {
+    for (slot, target) in SEEDS.iter().zip(REVERSED_TARGETS) {
+        slot.store(
+            crate::context::target_field(target, crate::context::TARGET_TEXTURE)
+                .map_or(0, |field| unsafe { *field }),
+            Ordering::Relaxed,
+        );
+    }
+}
+
+fn state(resource: &ID3D11Resource) -> Option<u32> {
+    let mut value = 0;
+    let mut size = 4;
+    unsafe { resource.GetPrivateData(&STATE, &raw mut size, Some((&raw mut value).cast())) }
+        .ok()?;
+    Some(value)
+}
+
+pub(crate) fn reversed(resource: &ID3D11Resource) -> bool {
+    state(resource).map_or_else(
+        || {
+            crate::active()
+                && SEEDS
+                    .iter()
+                    .any(|seed| seed.load(Ordering::Relaxed) == resource.as_raw() as usize)
+        },
+        |value| matches!(value, DIRTY | CLEAN),
+    )
+}
+
+pub(crate) fn mark(resource: &ID3D11Resource, reversed: bool) {
+    let value = if reversed { DIRTY } else { STANDARD };
+    let _ = unsafe { resource.SetPrivateData(&STATE, 4, Some((&raw const value).cast())) };
+}
+
+pub(crate) fn seeded_world(resource: &ID3D11Resource) -> bool {
+    [0, 2]
+        .into_iter()
+        .any(|i| SEEDS[i].load(Ordering::Relaxed) == resource.as_raw() as usize)
+}
+
+fn private_interface<T: Interface>(resource: &ID3D11Resource, key: &GUID) -> Option<T> {
+    let mut pointer: *mut c_void = core::ptr::null_mut();
+    let mut size = 8;
+    unsafe { resource.GetPrivateData(key, &raw mut size, Some((&raw mut pointer).cast())) }.ok()?;
+    (!pointer.is_null()).then(|| unsafe { T::from_raw(pointer) })
+}
+
+fn store_interface(
+    resource: &ID3D11Resource,
+    key: &GUID,
+    value: &impl Interface,
+) -> Result<(), String> {
+    unsafe {
+        (resource.vtable().base__.SetPrivateDataInterface)(resource.as_raw(), key, value.as_raw())
+    }
+    .ok()
+    .map_err(|e| e.to_string())
+}
+
+fn source_view(texture: &ID3D11Texture2D) -> Result<ID3D11ShaderResourceView, String> {
+    let mut desc = D3D11_TEXTURE2D_DESC::default();
+    unsafe { texture.GetDesc(&raw mut desc) };
+    if desc.SampleDesc.Count != 1 || desc.ArraySize != 1 || desc.MipLevels != 1 {
+        return Err("depth arrays, mip chains or multisampling are unsupported".into());
+    }
+    let format = match desc.Format {
+        DXGI_FORMAT_R32G8X24_TYPELESS | DXGI_FORMAT_D32_FLOAT_S8X24_UINT => {
+            DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS
+        }
+        DXGI_FORMAT_R32_TYPELESS | DXGI_FORMAT_R32_FLOAT | DXGI_FORMAT_D32_FLOAT => {
+            DXGI_FORMAT_R32_FLOAT
+        }
+        DXGI_FORMAT_R24G8_TYPELESS | DXGI_FORMAT_D24_UNORM_S8_UINT => {
+            DXGI_FORMAT_R24_UNORM_X8_TYPELESS
+        }
+        _ => {
+            return Err(format!(
+                "unsupported depth resource format {}",
+                desc.Format.0
+            ));
+        }
+    };
+    let view_desc = D3D11_SHADER_RESOURCE_VIEW_DESC {
+        Format: format,
+        ViewDimension: D3D_SRV_DIMENSION_TEXTURE2D,
+        Anonymous: D3D11_SHADER_RESOURCE_VIEW_DESC_0 {
+            Texture2D: D3D11_TEX2D_SRV {
+                MostDetailedMip: 0,
+                MipLevels: 1,
+            },
+        },
+    };
+    let device = unsafe { texture.GetDevice() }.map_err(|e| e.to_string())?;
+    let mut view = None;
+    unsafe {
+        device.CreateShaderResourceView(texture, Some(&raw const view_desc), Some(&raw mut view))
+    }
+    .map_err(|e| e.to_string())?;
+    view.ok_or_else(|| "no depth source view".into())
+}
+
+fn cached_copy(
+    resource: &ID3D11Resource,
+    input: &ID3D11ShaderResourceView,
+) -> Result<Copy, String> {
+    let texture = resource
+        .cast::<ID3D11Texture2D>()
+        .map_err(|e| e.to_string())?;
+    let mut desc = D3D11_TEXTURE2D_DESC::default();
+    unsafe { texture.GetDesc(&raw mut desc) };
+    if let (Some(view), Some(target)) = (
+        private_interface::<ID3D11ShaderResourceView>(resource, &VIEW),
+        private_interface::<ID3D11UnorderedAccessView>(resource, &TARGET),
+    ) {
+        let standard = unsafe { view.GetResource() }
+            .and_then(|resource| resource.cast::<ID3D11Texture2D>())
+            .map_err(|e| e.to_string())?;
+        return Ok(Copy {
+            standard,
+            view,
+            target,
+            engine_view: input.clone(),
+            width: desc.Width,
+            height: desc.Height,
+        });
+    }
+    let device = unsafe { texture.GetDevice() }.map_err(|e| e.to_string())?;
+    let copy = create_copy(&device, &texture, input.as_raw())?;
+    store_interface(resource, &VIEW, &copy.view)?;
+    store_interface(resource, &TARGET, &copy.target)?;
+    Ok(copy)
+}
+
+fn refresh(
+    context: &ID3D11DeviceContext,
+    resource: &ID3D11Resource,
+    input: Option<&ID3D11ShaderResourceView>,
+) -> Result<ID3D11ShaderResourceView, String> {
+    if matches!(state(resource), Some(CLEAN | STANDARD_CLEAN))
+        && let Some(view) = private_interface(resource, &VIEW)
+    {
+        return Ok(view);
+    }
+    let input = match input {
+        Some(input) => input.clone(),
+        None => source_view(
+            &resource
+                .cast::<ID3D11Texture2D>()
+                .map_err(|e| e.to_string())?,
+        )?,
+    };
+    let copy = cached_copy(resource, &input)?;
+    let inverted = reversed(resource);
+    let shader = (if inverted {
+        &SHADER_OBJECT
+    } else {
+        &STANDARD_SHADER_OBJECT
+    })
+    .lock()
+    .unwrap()
+    .clone()
+    .ok_or("no depth copy shader")?;
+    let value = if inverted { CLEAN } else { STANDARD_CLEAN };
+    unsafe { resource.SetPrivateData(&STATE, 4, Some((&raw const value).cast())) }
+        .map_err(|e| e.to_string())?;
+    convert(context, &shader, &copy);
+    COUNT.fetch_add(1, Ordering::Relaxed);
+    Ok(copy.view)
+}
+
+pub(crate) fn report(message: &str) {
+    if UNSUPPORTED.fetch_add(1, Ordering::Relaxed) == 0 {
+        crate::log(&format!("depth compatibility gap: {message}"));
+    }
+}
+
+pub(crate) fn run(context: &ID3D11DeviceContext, resource: &ID3D11Resource) {
+    if !COPYING.get()
+        && !matches!(state(resource), Some(CLEAN | STANDARD_CLEAN))
+        && private_interface::<ID3D11ShaderResourceView>(resource, &VIEW).is_some()
+        && let Err(error) = refresh(context, resource, None)
+    {
+        report(&error);
+    }
+}
+
+pub(crate) fn stand_in(context: &ID3D11DeviceContext, view: *mut c_void) -> Option<*mut c_void> {
+    if COPYING.get() {
+        return None;
+    }
+    let input = unsafe { ID3D11ShaderResourceView::from_raw_borrowed(&view) }?;
+    let mut desc = D3D11_SHADER_RESOURCE_VIEW_DESC::default();
+    unsafe { input.GetDesc(&raw mut desc) };
+    if !matches!(
+        desc.Format,
+        DXGI_FORMAT_R32_FLOAT
+            | DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS
+            | DXGI_FORMAT_R24_UNORM_X8_TYPELESS
+    ) {
+        return None;
+    }
+    let resource = unsafe { input.GetResource() }.ok()?;
+    if !reversed(&resource)
+        && private_interface::<ID3D11ShaderResourceView>(&resource, &VIEW).is_none()
+    {
+        return None;
+    }
+    match refresh(context, &resource, Some(input)) {
+        Ok(copy) => Some(copy.as_raw()),
+        Err(error) => {
+            report(&error);
+            None
+        }
+    }
+}
+
+pub(crate) fn copied(
+    context: &ID3D11DeviceContext,
+    destination: &ID3D11Resource,
+    source: &ID3D11Resource,
+) {
+    if (reversed(source) || reversed(destination))
+        && let Err(error) = compatible(destination, source).and_then(|(destination, source)| {
+            if destination.Width == source.Width && destination.Height == source.Height {
+                Ok(())
+            } else {
+                Err("full depth copy dimensions differ".into())
+            }
+        })
+    {
+        report(&error);
+        return;
+    }
+    copied_region(context, destination, source);
+}
+
+fn compatible(
+    destination: &ID3D11Resource,
+    source: &ID3D11Resource,
+) -> Result<(D3D11_TEXTURE2D_DESC, D3D11_TEXTURE2D_DESC), String> {
+    let mut descriptions = Vec::new();
+    for resource in [destination, source] {
+        let texture = resource
+            .cast::<ID3D11Texture2D>()
+            .map_err(|e| e.to_string())?;
+        let mut desc = D3D11_TEXTURE2D_DESC::default();
+        unsafe { texture.GetDesc(&raw mut desc) };
+        if desc.SampleDesc.Count != 1 || desc.ArraySize != 1 || desc.MipLevels != 1 {
+            return Err("depth arrays, mip chains or multisampling are unsupported".into());
+        }
+        descriptions.push(desc);
+    }
+    let group = |format| match format {
+        DXGI_FORMAT_R32G8X24_TYPELESS | DXGI_FORMAT_D32_FLOAT_S8X24_UINT => 1,
+        DXGI_FORMAT_R32_TYPELESS | DXGI_FORMAT_R32_FLOAT | DXGI_FORMAT_D32_FLOAT => 2,
+        DXGI_FORMAT_R24G8_TYPELESS | DXGI_FORMAT_D24_UNORM_S8_UINT => 3,
+        _ => 0,
+    };
+    if group(descriptions[0].Format) == 0
+        || group(descriptions[0].Format) != group(descriptions[1].Format)
+    {
+        return Err(format!(
+            "incompatible depth copy formats {} -> {}",
+            descriptions[1].Format.0, descriptions[0].Format.0
+        ));
+    }
+    Ok((descriptions[0], descriptions[1]))
+}
+
+pub(crate) fn copied_region(
+    context: &ID3D11DeviceContext,
+    destination: &ID3D11Resource,
+    source: &ID3D11Resource,
+) {
+    if COPYING.get() {
+        return;
+    }
+    if reversed(source)
+        || state(destination).is_some()
+        || SEEDS
+            .iter()
+            .any(|seed| seed.load(Ordering::Relaxed) == destination.as_raw() as usize)
+    {
+        mark(destination, reversed(source));
+        COPIED.fetch_add(1, Ordering::Relaxed);
+        run(context, destination);
+    }
+}
+
+pub(crate) fn release() {
+    SHADER_OBJECT.lock().unwrap().take();
+    STANDARD_SHADER_OBJECT.lock().unwrap().take();
+    for seed in &SEEDS {
+        seed.store(0, Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn counters() -> String {
+    format!(
+        "depth copies {} (tracked transfers {}, unsupported {})",
+        count(),
+        COPIED.load(Ordering::Relaxed),
+        UNSUPPORTED.load(Ordering::Relaxed)
+    )
 }
 
 fn create_copy(
@@ -76,6 +472,9 @@ fn create_copy(
 ) -> Result<Copy, String> {
     let mut depth = D3D11_TEXTURE2D_DESC::default();
     unsafe { texture.GetDesc(&raw mut depth) };
+    if depth.SampleDesc.Count != 1 || depth.ArraySize != 1 || depth.MipLevels != 1 {
+        return Err("depth arrays, mip chains or multisampling are unsupported".into());
+    }
     let desc = D3D11_TEXTURE2D_DESC {
         Width: depth.Width,
         Height: depth.Height,
@@ -101,7 +500,7 @@ fn create_copy(
     unsafe { device.CreateUnorderedAccessView(&standard, None, Some(&raw mut unordered)) }
         .map_err(|e| format!("copy target: {e}"))?;
     Ok(Copy {
-        _standard: standard,
+        standard,
         view: view.ok_or("copy view")?,
         target: unordered.ok_or("copy target")?,
         engine_view: unsafe { ID3D11ShaderResourceView::from_raw_borrowed(&engine_view) }
@@ -112,31 +511,18 @@ fn create_copy(
     })
 }
 
-fn create_all(device: &ID3D11Device) -> Result<Copies, String> {
-    let code = compile()?;
-    let bytes = unsafe {
-        core::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize())
+fn compile(invert: bool) -> Result<ID3DBlob, String> {
+    let source = if invert {
+        SHADER.to_owned()
+    } else {
+        SHADER.replace("1.0 - depth[id.xy]", "depth[id.xy]")
     };
-    let mut shader = None;
-    unsafe { device.CreateComputeShader(bytes, None, Some(&raw mut shader)) }
-        .map_err(|e| format!("copy shader: {e}"))?;
-    let copies = REVERSED_TARGETS
-        .iter()
-        .map(|&t| create(device, t))
-        .collect::<Result<_, _>>()?;
-    Ok(Copies {
-        shader: shader.ok_or("copy shader")?,
-        copies,
-    })
-}
-
-fn compile() -> Result<ID3DBlob, String> {
     let mut code = None;
     let mut errors = None;
     unsafe {
         D3DCompile(
-            SHADER.as_ptr().cast(),
-            SHADER.len(),
+            source.as_ptr().cast(),
+            source.len(),
             s!("reversed-z"),
             None,
             None,
@@ -161,24 +547,6 @@ fn compile() -> Result<ID3DBlob, String> {
     code.ok_or_else(|| "compile: no code".into())
 }
 
-/// Writes 1 - depth of depth target `target` (one of [`REVERSED_TARGETS`]) into its copy.
-pub(crate) fn run(target: usize) {
-    let Some(k) = REVERSED_TARGETS.iter().position(|&t| t == target) else {
-        return;
-    };
-    if !crate::active() {
-        return;
-    }
-    let copies = COPIES.lock().unwrap();
-    let (Some(all), Some(context)) = (copies.as_ref(), immediate()) else {
-        return;
-    };
-    let c = &all.copies[k];
-    crate::context::mark_copied(target);
-    convert(&context, &all.shader, c);
-    COUNT.fetch_add(1, Ordering::Relaxed);
-}
-
 fn preserve_resources(context: &ID3D11DeviceContext, run: impl FnOnce()) {
     macro_rules! preserve {
         ($($name:ident: $get:ident => $set:ident),*) => {
@@ -201,7 +569,7 @@ fn preserve_resources(context: &ID3D11DeviceContext, run: impl FnOnce()) {
 }
 
 fn convert(context: &ID3D11DeviceContext, shader: &ID3D11ComputeShader, c: &Copy) {
-    let previous_copying = COPYING.replace(true);
+    let _internal = Internal::enter();
     preserve_resources(context, || {
         crate::context::without_targets(context, || unsafe {
             let mut previous_shader = None;
@@ -229,51 +597,9 @@ fn convert(context: &ID3D11DeviceContext, shader: &ID3D11ComputeShader, c: &Copy
             );
         });
     });
-    COPYING.set(previous_copying);
 }
 
-/// Puts the copy's shader view (or the engine's back) in its depth target's slot, holding the
-/// reference the slot owns.
-fn swap(target: usize, c: &Copy, on: bool) {
-    let Some(slot) = target_field(target, TARGET_SHADER_VIEW) else {
-        return;
-    };
-    let ours = c.view.as_raw();
-    let current = unsafe { *slot } as *mut c_void;
-    let wanted = if on { ours } else { c.engine_view.as_raw() };
-    if current == wanted {
-        return;
-    }
-    if on {
-        core::mem::forget(c.view.clone());
-    } else if current == ours {
-        drop(unsafe { ID3D11ShaderResourceView::from_raw(ours) });
-    }
-    unsafe { *slot = wanted as usize };
-}
-
-/// The copy's view standing in for `view` when `view` is a reversed depth target's own.
-pub(crate) fn stand_in(view: *mut c_void) -> Option<*mut c_void> {
-    if view.is_null() || COPYING.get() {
-        return None;
-    }
-    let k = ENGINE_VIEWS
-        .iter()
-        .position(|e| e.load(Ordering::Relaxed) == view as usize)
-        .or_else(|| {
-            let textures = REVERSED_TARGETS.map(|target| {
-                target_field(target, TARGET_TEXTURE).map_or(0, |slot| unsafe { *slot })
-            });
-            alias_index(view, &textures)
-        })?;
-    let copy = COPY_VIEWS[k].load(Ordering::Relaxed);
-    if copy == 0 {
-        return None;
-    }
-    crate::context::refresh_depth(REVERSED_TARGETS[k]);
-    Some(copy as *mut c_void)
-}
-
+#[cfg(test)]
 fn alias_index(view: *mut c_void, textures: &[usize]) -> Option<usize> {
     let view = unsafe { ID3D11ShaderResourceView::from_raw_borrowed(&view) }?;
     let mut desc = D3D11_SHADER_RESOURCE_VIEW_DESC::default();
@@ -290,35 +616,6 @@ fn alias_index(view: *mut c_void, textures: &[usize]) -> Option<usize> {
     textures
         .iter()
         .position(|&texture| texture == resource.as_raw() as usize)
-}
-
-/// Swaps the copies in or out, making them first if needed.
-pub(crate) fn set_swapped(on: bool) {
-    let mut copies = COPIES.lock().unwrap();
-    if on && copies.is_none() {
-        match device()
-            .ok_or_else(|| "no device".to_owned())
-            .and_then(|d| create_all(&d))
-        {
-            Ok(c) => *copies = Some(c),
-            Err(e) => crate::log(&format!("depth copies unavailable: {e}")),
-        }
-    }
-    if let Some(all) = copies.as_ref() {
-        for (k, (&target, c)) in REVERSED_TARGETS.iter().zip(&all.copies).enumerate() {
-            swap(target, c, on);
-            ENGINE_VIEWS[k].store(c.engine_view.as_raw() as usize, Ordering::Relaxed);
-            COPY_VIEWS[k].store(
-                if on { c.view.as_raw() as usize } else { 0 },
-                Ordering::Relaxed,
-            );
-        }
-    }
-}
-
-pub(crate) fn release() {
-    set_swapped(false);
-    *COPIES.lock().unwrap() = None;
 }
 
 #[cfg(test)]
@@ -408,7 +705,7 @@ pub(crate) mod tests {
         let copy = create_copy(device, &source, input.as_raw()).unwrap();
         let om_copy = create_copy(device, &source, input.as_raw()).unwrap();
         let cs_copy = create_copy(device, &source, input.as_raw()).unwrap();
-        let code = compile().unwrap();
+        let code = compile(true).unwrap();
         let code = unsafe {
             core::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize())
         };
@@ -518,6 +815,153 @@ pub(crate) mod tests {
             context.Unmap(&read, 0);
             context.ClearState();
         }
+        initialize(device).unwrap();
+        let resource = source.cast::<ID3D11Resource>().unwrap();
+        mark(&resource, true);
+        let mut destination = None;
+        unsafe { device.CreateTexture2D(&raw const source_desc, None, Some(&raw mut destination)) }
+            .unwrap();
+        let destination = destination.unwrap();
+        let destination_resource = destination.cast::<ID3D11Resource>().unwrap();
+        unsafe { context.CopyResource(&destination, &source) };
+        copied(context, &destination_resource, &resource);
+        assert!(reversed(&destination_resource));
+        let destination_view = source_view(&destination).unwrap();
+        let stand_in = stand_in(context, destination_view.as_raw()).unwrap();
+        assert_ne!(stand_in, destination_view.as_raw());
+        let stand_in = unsafe { ID3D11ShaderResourceView::from_raw_borrowed(&stand_in) }
+            .unwrap()
+            .clone();
+        let read_first = |resource: &ID3D11Resource| unsafe {
+            context.CopyResource(&read, resource);
+            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            context
+                .Map(&read, 0, D3D11_MAP_READ, 0, Some(&raw mut mapped))
+                .unwrap();
+            let first = mapped.pData.cast::<f32>().read_unaligned();
+            context.Unmap(&read, 0);
+            first
+        };
+        let standard_resource = unsafe { stand_in.GetResource() }.unwrap();
+        assert_eq!(read_first(&standard_resource), 1.0);
+        let mut chained = None;
+        unsafe { device.CreateTexture2D(&raw const source_desc, None, Some(&raw mut chained)) }
+            .unwrap();
+        let chained = chained.unwrap();
+        let chained_resource = chained.cast::<ID3D11Resource>().unwrap();
+        unsafe { context.CopyResource(&chained, &destination) };
+        copied(context, &chained_resource, &destination_resource);
+        assert!(reversed(&chained_resource));
+        let chained_view = source_view(&chained).unwrap();
+        assert!(super::stand_in(context, chained_view.as_raw()).is_some());
+        mark(&resource, false);
+        unsafe { context.CopyResource(&destination, &source) };
+        copied(context, &destination_resource, &resource);
+        assert!(!reversed(&destination_resource));
+        assert_eq!(
+            super::stand_in(context, destination_view.as_raw()).unwrap(),
+            stand_in.as_raw()
+        );
+        assert_eq!(
+            read_first(&standard_resource),
+            0.0,
+            "an existing standard view must refresh when the source changes convention"
+        );
+        partial_copy(device, context, depth_desc, &input);
+        release();
         crate::context::remove();
+    }
+
+    fn partial_copy(
+        device: &ID3D11Device,
+        context: &ID3D11DeviceContext,
+        desc: D3D11_TEXTURE2D_DESC,
+        bound_input: &ID3D11ShaderResourceView,
+    ) {
+        let desc = D3D11_TEXTURE2D_DESC {
+            Format: DXGI_FORMAT_R32_FLOAT,
+            BindFlags: D3D11_BIND_SHADER_RESOURCE.0.cast_unsigned(),
+            ..desc
+        };
+        let mut textures = Vec::new();
+        for value in [0.2f32, 0.6] {
+            let data = [value; 143];
+            let initial = D3D11_SUBRESOURCE_DATA {
+                pSysMem: data.as_ptr().cast(),
+                SysMemPitch: 13 * 4,
+                ..Default::default()
+            };
+            let mut texture = None;
+            unsafe {
+                device.CreateTexture2D(
+                    &raw const desc,
+                    Some(&raw const initial),
+                    Some(&raw mut texture),
+                )
+            }
+            .unwrap();
+            textures.push(texture.unwrap());
+        }
+        let source = textures[0].cast::<ID3D11Resource>().unwrap();
+        let destination = textures[1].cast::<ID3D11Resource>().unwrap();
+        mark(&source, true);
+        mark(&destination, false);
+        unsafe { context.PSSetShaderResources(7, Some(&[Some(bound_input.clone())])) };
+        let region = D3D11_BOX {
+            left: 0,
+            top: 0,
+            front: 0,
+            right: 4,
+            bottom: 4,
+            back: 1,
+        };
+        prepare_region(context, &destination, &source, 0, [0; 3], Some(&region)).unwrap();
+        let mut restored = [None];
+        unsafe { context.PSGetShaderResources(7, Some(&mut restored)) };
+        assert_eq!(
+            restored[0].as_ref().map(Interface::as_raw),
+            Some(bound_input.as_raw())
+        );
+        unsafe {
+            context.CopySubresourceRegion(
+                &destination,
+                0,
+                0,
+                0,
+                0,
+                &source,
+                0,
+                Some(&raw const region),
+            );
+        }
+        copied_region(context, &destination, &source);
+        assert!(reversed(&destination));
+        let desc = D3D11_TEXTURE2D_DESC {
+            Usage: D3D11_USAGE_STAGING,
+            BindFlags: 0,
+            CPUAccessFlags: D3D11_CPU_ACCESS_READ.0.cast_unsigned(),
+            ..desc
+        };
+        let mut read = None;
+        unsafe { device.CreateTexture2D(&raw const desc, None, Some(&raw mut read)) }.unwrap();
+        let read = read.unwrap();
+        unsafe {
+            context.CopyResource(&read, &destination);
+            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            context
+                .Map(&read, 0, D3D11_MAP_READ, 0, Some(&raw mut mapped))
+                .unwrap();
+            let first = mapped.pData.cast::<u8>();
+            let last = first.add(10 * mapped.RowPitch as usize + 12 * 4);
+            let depth =
+                |pointer: *const u8| f32::from_ne_bytes(pointer.cast::<[u8; 4]>().read_unaligned());
+            assert!((depth(first) - 0.2).abs() < 0.000_001);
+            assert!(
+                (depth(last) - 0.4).abs() < 0.000_001,
+                "untouched depth must be normalized"
+            );
+            context.Unmap(&read, 0);
+            context.ClearState();
+        }
     }
 }

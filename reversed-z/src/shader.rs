@@ -1,4 +1,4 @@
-//! Vertex bytecode and mirrored shaders owned by their original D3D objects.
+//! Captured bytecode and mirrored shaders owned by their original D3D objects.
 
 use core::ffi::c_void;
 use std::cell::Cell;
@@ -7,7 +7,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE, D3D_FEATURE_LEVEL};
-use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11VertexShader};
+use windows::Win32::Graphics::Direct3D11::{
+    ID3D11Device, ID3D11DeviceChild, ID3D11PixelShader, ID3D11VertexShader,
+};
 use windows::Win32::Graphics::Dxgi::DXGI_SWAP_CHAIN_DESC;
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows::core::{GUID, HRESULT, Interface, s, w};
@@ -53,15 +55,19 @@ const TWIN: GUID = GUID::from_u128(0x68471e87_b4a1_43de_842f_6907faeae34e);
 const CONSTANTS: GUID = GUID::from_u128(0x66b348c6_c52c_47dc_81c5_650970d4c881);
 const NO_CONSTANTS: u32 = u32::MAX;
 const FAILED: u32 = u32::MAX - 1;
+const UNCHANGED: u32 = u32::MAX - 2;
 
 static CREATE_DEVICE: Mutex<Option<hook::Hook<CreateDeviceFn>>> = Mutex::new(None);
 static CREATE_SWAP_CHAIN: Mutex<Option<hook::Hook<CreateSwapChainFn>>> = Mutex::new(None);
 static CREATE_VERTEX: Mutex<Option<hook::Hook<CreateVertexFn>>> = Mutex::new(None);
+static CREATE_PIXEL: Mutex<Option<hook::Hook<CreateVertexFn>>> = Mutex::new(None);
 static CAPTURED: AtomicU64 = AtomicU64::new(0);
 static MADE: AtomicU64 = AtomicU64::new(0);
 static PRECISE: AtomicU64 = AtomicU64::new(0);
 static FAILURES: AtomicU64 = AtomicU64::new(0);
 static MISSED: AtomicU64 = AtomicU64::new(0);
+static PIXEL_MADE: AtomicU64 = AtomicU64::new(0);
+static PIXEL_FAILURES: AtomicU64 = AtomicU64::new(0);
 thread_local! { static BUILDING: Cell<bool> = const { Cell::new(false) }; }
 
 fn install_hook<F: Copy>(
@@ -113,6 +119,11 @@ pub(crate) fn install_device(device: &ID3D11Device) -> Result<(), String> {
         &CREATE_VERTEX,
         device.vtable().CreateVertexShader as usize,
         create_vertex as CreateVertexFn,
+    )?;
+    install_hook(
+        &CREATE_PIXEL,
+        device.vtable().CreatePixelShader as usize,
+        create_pixel as CreateVertexFn,
     )
 }
 
@@ -120,7 +131,12 @@ pub(crate) fn remove() {
     macro_rules! remove { ($($slot:ident),*) => { $(
         if let Some(hook) = $slot.lock().unwrap().take() { let _ = unsafe { hook.remove() }; }
     )* }; }
-    remove!(CREATE_SWAP_CHAIN, CREATE_DEVICE, CREATE_VERTEX);
+    remove!(
+        CREATE_SWAP_CHAIN,
+        CREATE_DEVICE,
+        CREATE_VERTEX,
+        CREATE_PIXEL
+    );
 }
 
 fn created(device: *mut *mut c_void, result: HRESULT) {
@@ -180,32 +196,38 @@ unsafe extern "system" fn create_swap_chain(
     result
 }
 
-unsafe extern "system" fn create_vertex(
-    device: *mut c_void,
-    code: *const c_void,
-    size: usize,
-    linkage: *mut c_void,
-    shader: *mut *mut c_void,
-) -> HRESULT {
-    let result = unsafe { original(&CREATE_VERTEX)(device, code, size, linkage, shader) };
-    if result.is_ok()
-        && !shader.is_null()
-        && !code.is_null()
-        && !BUILDING.get()
-        && let Some(shader) = unsafe { ID3D11VertexShader::from_raw_borrowed(&*shader) }
-        && let Ok(size) = u32::try_from(size)
-    {
-        match unsafe { shader.SetPrivateData(&BYTECODE, size, Some(code)) } {
-            Ok(()) => {
-                CAPTURED.fetch_add(1, Ordering::Relaxed);
+macro_rules! creation_hook {
+    ($name:ident, $slot:ident) => {
+        unsafe extern "system" fn $name(
+            device: *mut c_void,
+            code: *const c_void,
+            size: usize,
+            linkage: *mut c_void,
+            shader: *mut *mut c_void,
+        ) -> HRESULT {
+            let result = unsafe { original(&$slot)(device, code, size, linkage, shader) };
+            if result.is_ok()
+                && !shader.is_null()
+                && !code.is_null()
+                && !BUILDING.get()
+                && let Some(shader) = unsafe { ID3D11DeviceChild::from_raw_borrowed(&*shader) }
+                && let Ok(size) = u32::try_from(size)
+            {
+                match unsafe { shader.SetPrivateData(&BYTECODE, size, Some(code)) } {
+                    Ok(()) => {
+                        CAPTURED.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(e) => crate::log(&format!("shader bytecode capture failed: {e}")),
+                }
             }
-            Err(e) => crate::log(&format!("vertex bytecode capture failed: {e}")),
+            result
         }
-    }
-    result
+    };
 }
+creation_hook!(create_vertex, CREATE_VERTEX);
+creation_hook!(create_pixel, CREATE_PIXEL);
 
-fn bytecode(shader: &ID3D11VertexShader) -> Option<Vec<u8>> {
+fn bytecode(shader: &ID3D11DeviceChild) -> Option<Vec<u8>> {
     let mut size = 0;
     unsafe { shader.GetPrivateData(&BYTECODE, &raw mut size, None) }.ok()?;
     let mut code = vec![0; size as usize];
@@ -218,6 +240,33 @@ pub(crate) fn mirrored(
     shader: &ID3D11VertexShader,
     fallback: impl FnOnce() -> Option<Vec<u8>>,
 ) -> Option<(ID3D11VertexShader, Option<u32>)> {
+    mirror(
+        shader,
+        fallback,
+        |code| crate::twin::mirrored(code).map(crate::twin::Pixel::Mirrored),
+        |device| device.vtable().CreateVertexShader,
+        true,
+    )
+}
+
+pub(crate) fn pixel(shader: &ID3D11PixelShader) -> Option<ID3D11PixelShader> {
+    mirror(
+        shader,
+        || None,
+        crate::twin::pixel,
+        |device| device.vtable().CreatePixelShader,
+        false,
+    )
+    .map(|(shader, _)| shader)
+}
+
+fn mirror<S: Interface + core::ops::Deref<Target = ID3D11DeviceChild>>(
+    shader: &S,
+    fallback: impl FnOnce() -> Option<Vec<u8>>,
+    rewrite: impl FnOnce(&[u8]) -> Option<crate::twin::Pixel>,
+    create: impl FnOnce(&ID3D11Device) -> CreateVertexFn,
+    vertex: bool,
+) -> Option<(S, Option<u32>)> {
     let mut slot = NO_CONSTANTS;
     let mut size = 4;
     if unsafe { shader.GetPrivateData(&CONSTANTS, &raw mut size, Some((&raw mut slot).cast())) }
@@ -225,6 +274,9 @@ pub(crate) fn mirrored(
     {
         if slot == FAILED {
             return None;
+        }
+        if slot == UNCHANGED {
+            return Some((shader.clone(), None));
         }
         let mut twin: *mut c_void = core::ptr::null_mut();
         size = 8;
@@ -234,55 +286,95 @@ pub(crate) fn mirrored(
             return None;
         }
         return Some((
-            unsafe { ID3D11VertexShader::from_raw(twin) },
+            unsafe { S::from_raw(twin) },
             (slot != NO_CONSTANTS).then_some(slot),
         ));
     }
     let Some(code) = bytecode(shader).or_else(fallback) else {
         if MISSED.fetch_add(1, Ordering::Relaxed) == 0 {
             crate::log(
-                "world vertex bytecode unavailable; replacement shaders created before capture may not be reversed",
+                "world shader bytecode unavailable; shaders created before capture may not be reversed",
             );
         }
         return None;
     };
-    let made = crate::twin::mirrored(&code).and_then(|rewritten| {
+    let Some(rewritten) = rewrite(&code) else {
+        slot = FAILED;
+        let _ = unsafe { shader.SetPrivateData(&CONSTANTS, 4, Some((&raw const slot).cast())) };
+        let failures = if vertex { &FAILURES } else { &PIXEL_FAILURES };
+        if failures.fetch_add(1, Ordering::Relaxed) == 0 {
+            crate::log(if vertex {
+                "world vertex shader rewrite refused"
+            } else {
+                "world pixel shader rewrite refused"
+            });
+        }
+        return None;
+    };
+    let crate::twin::Pixel::Mirrored(rewritten) = rewritten else {
+        slot = UNCHANGED;
+        let _ = unsafe { shader.SetPrivateData(&CONSTANTS, 4, Some((&raw const slot).cast())) };
+        return Some((shader.clone(), None));
+    };
+    let made = (|| {
         let device = unsafe { shader.GetDevice() }.ok()?;
-        let mut twin = None;
+        let mut twin = core::ptr::null_mut();
         let previous = BUILDING.replace(true);
-        let result =
-            unsafe { device.CreateVertexShader(&rewritten.code, None, Some(&raw mut twin)) };
+        let result = unsafe {
+            create(&device)(
+                device.as_raw(),
+                rewritten.code.as_ptr().cast(),
+                rewritten.code.len(),
+                core::ptr::null_mut(),
+                &raw mut twin,
+            )
+        };
         BUILDING.set(previous);
-        result.ok()?;
-        let twin = twin?;
-        unsafe { shader.SetPrivateDataInterface(&TWIN, &twin) }.ok()?;
+        result.ok().ok()?;
+        if twin.is_null() {
+            return None;
+        }
+        let twin = unsafe { S::from_raw(twin) };
+        let child: &ID3D11DeviceChild = shader;
+        let key = TWIN;
+        unsafe {
+            (child.vtable().SetPrivateDataInterface)(child.as_raw(), &raw const key, twin.as_raw())
+        }
+        .ok()
+        .ok()?;
         Some((twin, rewritten.constants))
-    });
+    })();
     slot = made
         .as_ref()
         .map_or(FAILED, |(_, slot)| slot.unwrap_or(NO_CONSTANTS));
     let _ = unsafe { shader.SetPrivateData(&CONSTANTS, 4, Some((&raw const slot).cast())) };
     if made.is_some() {
-        MADE.fetch_add(1, Ordering::Relaxed);
+        (if vertex { &MADE } else { &PIXEL_MADE }).fetch_add(1, Ordering::Relaxed);
         if slot != NO_CONSTANTS {
             PRECISE.fetch_add(1, Ordering::Relaxed);
         }
-    } else if FAILURES.fetch_add(1, Ordering::Relaxed) == 0 {
-        crate::log(
-            "a world vertex shader could not be mirrored; check ReversedZ counters before treating this renderer as compatible",
-        );
+    } else if (if vertex { &FAILURES } else { &PIXEL_FAILURES }).fetch_add(1, Ordering::Relaxed)
+        == 0
+    {
+        crate::log(if vertex {
+            "world vertex shader creation failed after rewriting"
+        } else {
+            "world pixel shader creation failed after rewriting"
+        });
     }
     made
 }
 
 pub(crate) fn counters() -> String {
     format!(
-        "vertex shader twins {} (precise {}, not made {}, bytecode misses {}), captured shaders {}",
+        "vertex shader twins {} (precise {}, not made {}, bytecode misses {}), captured shaders {}, pixel shader twins {} (not made {})",
         MADE.load(Ordering::Relaxed),
         PRECISE.load(Ordering::Relaxed),
         FAILURES.load(Ordering::Relaxed),
         MISSED.load(Ordering::Relaxed),
-        CAPTURED.load(Ordering::Relaxed)
+        CAPTURED.load(Ordering::Relaxed),
+        PIXEL_MADE.load(Ordering::Relaxed),
+        PIXEL_FAILURES.load(Ordering::Relaxed)
     )
 }
 
@@ -523,9 +615,155 @@ mod tests {
         assert!(mirrored(&original, || Some(code)).is_some());
         drop(twin);
         unsafe { context.ClearState() };
+        pixel_depth(&device, &context);
+        unsafe { context.ClearState() };
         crate::copy::tests::exercise(&device, &context);
         unsafe { context.ClearState() };
         crate::context::release_push_scale();
         remove();
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn pixel_depth(device: &ID3D11Device, context: &ID3D11DeviceContext) {
+        use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_D32_FLOAT, DXGI_SAMPLE_DESC};
+        let vertex_code = compile(
+            "float4 main(uint i : SV_VertexID) : SV_Position { return float4(i == 2 ? 3 : -1, i == 1 ? 3 : -1, 0.75, 1); }",
+        );
+        let mut vertex = None;
+        unsafe { device.CreateVertexShader(&vertex_code, None, Some(&raw mut vertex)) }.unwrap();
+        let color_desc = D3D11_TEXTURE2D_DESC {
+            Width: 2,
+            Height: 2,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: D3D11_BIND_RENDER_TARGET.0.cast_unsigned(),
+            ..Default::default()
+        };
+        let mut color = None;
+        unsafe { device.CreateTexture2D(&raw const color_desc, None, Some(&raw mut color)) }
+            .unwrap();
+        let color = color.unwrap();
+        let mut target = None;
+        unsafe { device.CreateRenderTargetView(&color, None, Some(&raw mut target)) }.unwrap();
+        let depth_desc = D3D11_TEXTURE2D_DESC {
+            Format: DXGI_FORMAT_D32_FLOAT,
+            BindFlags: D3D11_BIND_DEPTH_STENCIL.0.cast_unsigned(),
+            ..color_desc
+        };
+        let mut depth = None;
+        unsafe { device.CreateTexture2D(&raw const depth_desc, None, Some(&raw mut depth)) }
+            .unwrap();
+        let depth = depth.unwrap();
+        let mut depth_view = None;
+        unsafe { device.CreateDepthStencilView(&depth, None, Some(&raw mut depth_view)) }.unwrap();
+        let depth_view = depth_view.unwrap();
+        let state_desc = D3D11_DEPTH_STENCIL_DESC {
+            DepthEnable: true.into(),
+            DepthWriteMask: D3D11_DEPTH_WRITE_MASK_ALL,
+            DepthFunc: D3D11_COMPARISON_ALWAYS,
+            ..Default::default()
+        };
+        let mut state = None;
+        unsafe { device.CreateDepthStencilState(&raw const state_desc, Some(&raw mut state)) }
+            .unwrap();
+        let raster_desc = D3D11_RASTERIZER_DESC {
+            FillMode: D3D11_FILL_SOLID,
+            CullMode: D3D11_CULL_NONE,
+            DepthClipEnable: true.into(),
+            ..Default::default()
+        };
+        let mut raster = None;
+        unsafe { device.CreateRasterizerState(&raw const raster_desc, Some(&raw mut raster)) }
+            .unwrap();
+        for (semantic, expression, expected) in [
+            ("SV_Depth", "0.1 + 0.4 * p.z", 0.8f32),
+            ("SV_DepthGreaterEqual", "max(p.z, 0.45)", 0.55),
+            ("SV_DepthLessEqual", "min(p.z, 0.15)", 0.85),
+        ] {
+            let source = format!(
+                "float4 main(noperspective centroid float4 p : SV_Position, out float depth : {semantic}) : SV_Target {{ depth = {expression}; return float4(p.z, p.x, p.y, p.w); }}"
+            );
+            let code = compile_stage(&source, s!("ps_5_0"));
+            let mut original = None;
+            unsafe { device.CreatePixelShader(&code, None, Some(&raw mut original)) }.unwrap();
+            let original = original.unwrap();
+            let shader =
+                pixel(&original).unwrap_or_else(|| panic!("pixel rewrite failed for {semantic}"));
+            assert_ne!(shader.as_raw(), original.as_raw());
+            assert_eq!(pixel(&original).unwrap().as_raw(), shader.as_raw());
+            unsafe {
+                context.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                context.VSSetShader(vertex.as_ref(), None);
+                context.PSSetShader(&shader, None);
+                context.OMSetRenderTargets(Some(&[target.clone()]), &depth_view);
+                context.OMSetDepthStencilState(state.as_ref(), 0);
+                context.RSSetState(raster.as_ref());
+                context.RSSetViewports(Some(&[D3D11_VIEWPORT {
+                    Width: 2.0,
+                    Height: 2.0,
+                    MaxDepth: 1.0,
+                    ..Default::default()
+                }]));
+                context.ClearDepthStencilView(&depth_view, D3D11_CLEAR_DEPTH.0, 0.0, 0);
+                context.Draw(3, 0);
+                context.OMSetRenderTargets(None, None);
+            }
+            let mut values = Vec::new();
+            for (texture, desc, components) in
+                [(&color, color_desc, 4usize), (&depth, depth_desc, 1)]
+            {
+                let desc = D3D11_TEXTURE2D_DESC {
+                    Usage: D3D11_USAGE_STAGING,
+                    BindFlags: 0,
+                    CPUAccessFlags: D3D11_CPU_ACCESS_READ.0.cast_unsigned(),
+                    ..desc
+                };
+                let mut read = None;
+                unsafe { device.CreateTexture2D(&raw const desc, None, Some(&raw mut read)) }
+                    .unwrap();
+                let read = read.unwrap();
+                unsafe {
+                    context.CopyResource(&read, texture);
+                    let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+                    context
+                        .Map(&read, 0, D3D11_MAP_READ, 0, Some(&raw mut mapped))
+                        .unwrap();
+                    for component in 0..components {
+                        let data = mapped
+                            .pData
+                            .cast::<u8>()
+                            .add(component * 4)
+                            .cast::<[u8; 4]>()
+                            .read_unaligned();
+                        values.push(f32::from_ne_bytes(data));
+                    }
+                    context.Unmap(&read, 0);
+                }
+            }
+            assert_eq!(
+                &values[..4],
+                &[0.25, 0.5, 0.5, 1.0],
+                "{semantic}: pixel input must stay conventional"
+            );
+            assert!(
+                (values[4] - expected).abs() < 0.000_001,
+                "{semantic}: {values:?}"
+            );
+        }
+        let code = compile_stage(
+            "float4 main(float4 p : SV_Position) : SV_Target { return p.xxxx; }",
+            s!("ps_5_0"),
+        );
+        let mut original = None;
+        unsafe { device.CreatePixelShader(&code, None, Some(&raw mut original)) }.unwrap();
+        let original = original.unwrap();
+        assert_eq!(pixel(&original).unwrap().as_raw(), original.as_raw());
     }
 }

@@ -18,9 +18,11 @@ Copy the package's `Data` folder over the game's (or install the package with a 
 - To check it: with Improved Camera's near plane lowered (or `fNearDistance` set low), look at far mountains from a high place; with it on, landscape LOD no longer pokes through them as the camera turns.
 - Send back `reversed-z.log` and `skyrim-rs.log` with anything that looks wrong.
 
-## Build and package
+## Community Shaders
 
-Community Shaders compatibility is in development. The plugin captures replacement vertex shaders through Direct3D and gives precise twins their own projection constants in an unused buffer slot. This has passed synthetic D3D11 WARP tests; it has not yet been validated in game with Community Shaders or its features.
+Community Shaders compatibility is experimental. All changes are in this plugin: it captures vertex and pixel shaders through Direct3D, preserves conventional pixel depth, and tracks textures copied from world depth. Synthetic D3D11 WARP tests pass. Stock Community Shaders 1.9.1 runs with Terrain Blending and Upscaling, with no reported shader rewrite failures or unsupported depth copies in the tested exterior scenes. Visual validation is incomplete: a riverbank difference between Reversed-Z on and off is still under investigation.
+
+## Build and package
 
 ```
 git clone --recurse-submodules https://github.com/TwistedModding/skyrim-rs-reversed-z.git

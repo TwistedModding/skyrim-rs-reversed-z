@@ -7,8 +7,8 @@
 //! The pieces: the depth targets with stencil created as D32 float + S8 (byte patches before the
 //! renderer starts); while a world depth target is bound, vertex shaders swapped for twins that
 //! output w - z ([`twin`]) and the context's viewport depth ranges, depth-stencil and rasterizer
-//! states and depth clears mirrored ([`context`]); and a copy of 1 - depth that the depth target's
-//! shader view is swapped for ([`copy`]).
+//! states and depth clears mirrored ([`context`]); conventional depth views substituted at shader
+//! bindings, including textures copied from world depth ([`copy`]).
 
 use core::ffi::CStr;
 use std::io::Write as _;
@@ -111,7 +111,6 @@ fn engage() {
     match context::install() {
         Ok(()) => {
             READY.store(true, Ordering::Release);
-            copy::set_swapped(active());
             log(&format!(
                 "ready: world depth targets are D32 float, {}",
                 if active() { "on" } else { "off" }
@@ -136,7 +135,6 @@ fn set_wanted(on: bool) {
     if let Some(host) = HOST.get() {
         host.settings().set("enabled", on);
     }
-    copy::set_swapped(active());
 }
 
 static PARAMS: [Param; 1] = [Param::new(c"state", ScriptParamType::String, true)];

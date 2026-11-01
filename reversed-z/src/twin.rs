@@ -29,6 +29,9 @@ const RETC: u32 = 63;
 const DCL_CONSTANT_BUFFER: u32 = 89;
 const DCL_GLOBAL_FLAGS: u32 = 106;
 const DCL_OUTPUT_SIV: u32 = 103;
+const DCL_INPUT_PS_SGV: u32 = 99;
+const DCL_INPUT_PS_SIV: u32 = 100;
+const DCL_OUTPUT: u32 = 101;
 const DCL_TEMPS: u32 = 104;
 const DECLARATIONS: core::ops::RangeInclusive<u32> = 0x58..=0x6b;
 const NAME_POSITION: u32 = 1;
@@ -39,6 +42,9 @@ const OUTPUT: u32 = 2;
 const IMMEDIATE32: u32 = 4;
 const IMMEDIATE64: u32 = 5;
 const CONSTANT_BUFFER: u32 = 8;
+const OUTPUT_DEPTH: u32 = 12;
+const OUTPUT_DEPTH_GREATER_EQUAL: u32 = 38;
+const OUTPUT_DEPTH_LESS_EQUAL: u32 = 39;
 
 const NEGATE: u32 = 1 | (1 << 6);
 const EXTENDED: u32 = 1 << 31;
@@ -48,6 +54,11 @@ const CB_XYZW: u32 = 2 | (1 << 2) | (0xe4 << 4) | (CONSTANT_BUFFER << 12) | (2 <
 pub(crate) struct Mirrored {
     pub code: Vec<u8>,
     pub constants: Option<u32>,
+}
+
+pub(crate) enum Pixel {
+    Unchanged,
+    Mirrored(Mirrored),
 }
 
 #[derive(Clone)]
@@ -463,10 +474,21 @@ fn rebuild(container: &[u8], offsets: &[usize], at: usize, old: usize, tok: &[u3
     let mut shex = container[at..at + 4].to_vec();
     shex.extend((tok.len() as u32 * 4).to_le_bytes());
     shex.extend(tok.iter().flat_map(|t| t.to_le_bytes()));
-    let grown = tok.len() * 4 - old * 4;
+    replace_chunk(container, offsets, at, old * 4 + 8, &shex)
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn replace_chunk(
+    container: &[u8],
+    offsets: &[usize],
+    at: usize,
+    old: usize,
+    chunk: &[u8],
+) -> Vec<u8> {
+    let grown = chunk.len() - old;
     let mut twin = container[..at].to_vec();
-    twin.extend(shex);
-    twin.extend(&container[at + 8 + old * 4..]);
+    twin.extend(chunk);
+    twin.extend(&container[at + old..]);
     let total = twin.len() as u32;
     twin[24..28].copy_from_slice(&total.to_le_bytes());
     for (k, &o) in offsets.iter().enumerate() {
@@ -577,6 +599,188 @@ pub(crate) fn mirrored(container: &[u8]) -> Option<Mirrored> {
     })
 }
 
+fn reversed_depth_kind(kind: u32) -> Option<u32> {
+    match kind {
+        OUTPUT_DEPTH => Some(OUTPUT_DEPTH),
+        OUTPUT_DEPTH_GREATER_EQUAL => Some(OUTPUT_DEPTH_LESS_EQUAL),
+        OUTPUT_DEPTH_LESS_EQUAL => Some(OUTPUT_DEPTH_GREATER_EQUAL),
+        _ => None,
+    }
+}
+
+fn reverse_depth_signature(container: &[u8]) -> Option<Vec<u8>> {
+    let (offsets, _, _) = program(container)?;
+    let mut result = container.to_vec();
+    let mut changed = false;
+    for &at in &offsets {
+        let (stride, name_at, semantic_at) = match container.get(at..at + 4)? {
+            b"OSGN" => (24, 0, 8),
+            b"OSG5" => (28, 4, 12),
+            b"OSG1" => (32, 4, 12),
+            _ => continue,
+        };
+        let size = u32::from_le_bytes(container.get(at + 4..at + 8)?.try_into().ok()?) as usize;
+        let mut payload = container.get(at + 8..at + 8 + size)?.to_vec();
+        let word = |data: &[u8], at: usize| {
+            data.get(at..at + 4)
+                .and_then(|bytes| bytes.try_into().ok())
+                .map(u32::from_le_bytes)
+        };
+        let count = word(&payload, 0)? as usize;
+        let start = word(&payload, 4)? as usize;
+        for i in 0..count {
+            let record = start + i * stride;
+            let name = word(&payload, record + name_at)? as usize;
+            let name = payload.get(name..)?;
+            let name = name.get(..name.iter().position(|&byte| byte == 0)?)?;
+            let (semantic, name) = if name.eq_ignore_ascii_case(b"SV_DepthGreaterEqual") {
+                (68u32, b"SV_DepthLessEqual\0".as_slice())
+            } else if name.eq_ignore_ascii_case(b"SV_DepthLessEqual") {
+                (67u32, b"SV_DepthGreaterEqual\0".as_slice())
+            } else {
+                continue;
+            };
+            let new_name = u32::try_from(payload.len()).ok()?;
+            payload
+                .get_mut(record + name_at..record + name_at + 4)?
+                .copy_from_slice(&new_name.to_le_bytes());
+            payload
+                .get_mut(record + semantic_at..record + semantic_at + 4)?
+                .copy_from_slice(&semantic.to_le_bytes());
+            payload.extend(name);
+            changed = true;
+        }
+        if changed {
+            payload.resize(payload.len().next_multiple_of(4), 0);
+            let mut chunk = container[at..at + 4].to_vec();
+            chunk.extend(u32::try_from(payload.len()).ok()?.to_le_bytes());
+            chunk.extend(payload);
+            result = replace_chunk(container, &offsets, at, size + 8, &chunk);
+            break;
+        }
+    }
+    changed.then_some(result)
+}
+
+/// Preserves conventional pixel inputs and reverses explicit depth outputs.
+#[allow(clippy::cast_possible_truncation, clippy::too_many_lines)]
+pub(crate) fn pixel(container: &[u8]) -> Option<Pixel> {
+    let (offsets, at, tok) = program(container)?;
+    if tok[0] >> 16 != 0 {
+        return None;
+    }
+    let code = decode(&tok)?;
+    let mut position = None;
+    let mut depth = None;
+    let mut temps = None;
+    for ins in &code {
+        if matches!(ins.op, DCL_INPUT_PS_SGV | DCL_INPUT_PS_SIV)
+            && tok[ins.at + ins.len - 1] == NAME_POSITION
+        {
+            let input = operand(&tok, ins.at + 1)?.0;
+            if input.mask? & 4 != 0 {
+                position = Some((input.register()?, input.mask?));
+            }
+        } else if ins.op == DCL_OUTPUT {
+            let output = operand(&tok, ins.at + 1)?.0;
+            if let Some(kind) = reversed_depth_kind(output.kind) {
+                if depth.is_some() {
+                    return None;
+                }
+                depth = Some(kind);
+            }
+        } else if ins.op == DCL_TEMPS {
+            temps = Some(tok[ins.at + 1]);
+        }
+    }
+    if position.is_none() && depth.is_none() {
+        return Some(Pixel::Unchanged);
+    }
+    let base = temps.unwrap_or(0);
+    let depth_temp = base + u32::from(position.is_some());
+    let extra = u32::from(position.is_some()) + u32::from(depth.is_some());
+    let one = [1 | (IMMEDIATE32 << 12), 1.0f32.to_bits()];
+    let mut prologue = Vec::new();
+    if let Some((register, mask)) = position {
+        prologue.extend(instruction(
+            MOV,
+            &[
+                &reg(TEMP, base, Some(mask), XYZW, false),
+                &reg(INPUT, register, None, XYZW, false),
+            ],
+        ));
+        prologue.extend(instruction(
+            ADD,
+            &[
+                &reg(TEMP, base, Some(4), XYZW, false),
+                &one,
+                &reg(INPUT, register, None, [2; 4], true),
+            ],
+        ));
+    }
+    let tail = depth.map_or_else(Vec::new, |kind| {
+        instruction(
+            ADD,
+            &[
+                &[1 | (kind << 12)],
+                &one,
+                &reg(TEMP, depth_temp, None, [0; 4], true),
+            ],
+        )
+    });
+    let first = code
+        .iter()
+        .position(|ins| !DECLARATIONS.contains(&ins.op) && ins.op != CUSTOM_DATA)?;
+    let mut out = tok[..2].to_vec();
+    for (n, ins) in code.iter().enumerate() {
+        let mut body = tok[ins.at..ins.at + ins.len].to_vec();
+        if n == first {
+            if temps.is_none() {
+                out.extend([DCL_TEMPS | (2 << 24), extra]);
+            }
+            out.extend(&prologue);
+        }
+        if ins.op == DCL_TEMPS {
+            body[1] = base + extra;
+        }
+        if ins.op == DCL_OUTPUT {
+            let kind = (body[1] >> 12) & 0xff;
+            if let Some(kind) = reversed_depth_kind(kind) {
+                body[1] = (body[1] & !(0xff << 12)) | (kind << 12);
+            }
+        }
+        for source in ins.operands.iter().rev() {
+            let start = source.start - ins.at;
+            if source.kind == INPUT && position.is_some_and(|p| source.register() == Some(p.0)) {
+                body[start] = (body[start] & !(0xff << 12)) | (TEMP << 12);
+                body[source.end - ins.at - 1] = base;
+            } else if reversed_depth_kind(source.kind).is_some() {
+                if source.extended {
+                    return None;
+                }
+                body.splice(
+                    start..source.end - ins.at,
+                    reg(TEMP, depth_temp, Some(1), XYZW, false),
+                );
+            }
+        }
+        body[0] = (body[0] & !(0x7f << 24)) | ((body.len() as u32) << 24);
+        if matches!(ins.op, RET | RETC) {
+            out.extend(&tail);
+        }
+        out.extend(body);
+    }
+    out[1] = out.len() as u32;
+    let mut rewritten = rebuild(container, &offsets, at, tok.len(), &out);
+    if depth.is_some_and(|kind| kind != OUTPUT_DEPTH) {
+        rewritten = reverse_depth_signature(&rewritten)?;
+    }
+    Some(Pixel::Mirrored(Mirrored {
+        code: rewritten,
+        constants: None,
+    }))
+}
+
 /// The container checksum: MD5 rounds over everything after the checksum, with the bit length
 /// placed first in the last block and `(bits >> 2) | 1` last.
 #[allow(clippy::cast_possible_truncation)]
@@ -682,7 +886,8 @@ pub(crate) mod tests {
 
     pub(crate) fn compile_stage(source: &str, target: windows::core::PCSTR) -> Vec<u8> {
         let mut code = None;
-        unsafe {
+        let mut errors = None;
+        let result = unsafe {
             D3DCompile(
                 source.as_ptr().cast(),
                 source.len(),
@@ -694,10 +899,17 @@ pub(crate) mod tests {
                 0,
                 0,
                 &raw mut code,
-                None,
+                Some(&raw mut errors),
             )
-        }
-        .unwrap();
+        };
+        assert!(
+            result.is_ok(),
+            "{source}\n{}",
+            errors.as_ref().map_or_else(
+                || format!("{result:?}"),
+                |errors| String::from_utf8_lossy(&bytes(errors)).into_owned()
+            )
+        );
         bytes(&code.unwrap())
     }
 
@@ -781,5 +993,25 @@ pub(crate) mod tests {
     fn a_precise_shader_without_a_free_slot_is_refused() {
         let slots: Vec<u32> = (0..14).filter(|&slot| slot != 2).collect();
         assert!(super::mirrored(&compile(&occupied_slots(&slots))).is_none());
+    }
+
+    #[test]
+    fn conservative_pixel_depth_updates_the_output_signature() {
+        for (before, after) in [
+            ("SV_DepthGreaterEqual", "SV_DepthLessEqual"),
+            ("SV_DepthLessEqual", "SV_DepthGreaterEqual"),
+        ] {
+            let source = format!(
+                "float main(noperspective centroid float4 p : SV_Position) : {before} {{ return p.z; }}"
+            );
+            let super::Pixel::Mirrored(rewritten) =
+                super::pixel(&compile_stage(&source, s!("ps_5_0"))).unwrap()
+            else {
+                panic!("expected a depth rewrite");
+            };
+            let disassembly = text(&rewritten.code);
+            assert!(disassembly.contains(after), "{disassembly}");
+            assert!(!disassembly.contains(before), "{disassembly}");
+        }
     }
 }

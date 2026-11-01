@@ -18,7 +18,8 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_DEPTH_STENCIL_DESC, D3D11_DEPTH_STENCIL_VIEW_DESC, D3D11_DEPTH_WRITE_MASK_ALL,
     D3D11_RASTERIZER_DESC, D3D11_USAGE_DEFAULT, D3D11_VIEWPORT, ID3D11Buffer,
     ID3D11DepthStencilState, ID3D11DepthStencilView, ID3D11Device, ID3D11DeviceContext,
-    ID3D11RasterizerState, ID3D11RenderTargetView, ID3D11UnorderedAccessView, ID3D11VertexShader,
+    ID3D11PixelShader, ID3D11RasterizerState, ID3D11RenderTargetView, ID3D11Resource,
+    ID3D11UnorderedAccessView, ID3D11VertexShader,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
 use windows::core::Interface;
@@ -40,6 +41,17 @@ type SetViewportsFn = unsafe extern "system" fn(*mut c_void, u32, *const D3D11_V
 type ClearDepthFn = unsafe extern "system" fn(*mut c_void, *mut c_void, u32, f32, u8);
 type SetShaderFn = unsafe extern "system" fn(*mut c_void, *mut c_void, *const *mut c_void, u32);
 type CopyFn = unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void);
+type CopyRegionFn = unsafe extern "system" fn(
+    *mut c_void,
+    *mut c_void,
+    u32,
+    u32,
+    u32,
+    u32,
+    *mut c_void,
+    u32,
+    *const windows::Win32::Graphics::Direct3D11::D3D11_BOX,
+);
 type SetResourcesFn = unsafe extern "system" fn(*mut c_void, u32, u32, *const *mut c_void);
 type DrawFn = unsafe extern "system" fn(*mut c_void, u32, u32);
 type DrawIndexedFn = unsafe extern "system" fn(*mut c_void, u32, u32, i32);
@@ -53,9 +65,6 @@ type DrawAutoFn = unsafe extern "system" fn(*mut c_void);
 const TARGET_STRIDE: usize = 0x98;
 pub(crate) const TARGET_TEXTURE: usize = 0x2018;
 const TARGET_VIEW: usize = 0x2020;
-pub(crate) const TARGET_SHADER_VIEW: usize = 0x20a0;
-/// The depth targets the world cameras draw into: the scene depth and the first-person copy.
-const WORLD_TARGETS: [usize; 2] = [0, 7];
 /// Address Library id of the engine's current vertex shader record (`SetCurrentVertexShader`
 /// stores it before binding): the D3D shader +0x8, the bytecode size +0x10, the bytecode +0x68.
 const CURRENT_VERTEX_SHADER: u64 = 388_906;
@@ -104,6 +113,7 @@ hooks! {
     SET_VIEWPORTS: SetViewportsFn = RSSetViewports => set_viewports,
     CLEAR_DEPTH: ClearDepthFn = ClearDepthStencilView => clear_depth,
     SET_VERTEX_SHADER: SetShaderFn = VSSetShader => set_vertex_shader,
+    SET_PIXEL_SHADER: SetShaderFn = PSSetShader => set_pixel_shader,
     SET_PIXEL_RESOURCES: SetResourcesFn = PSSetShaderResources => set_pixel_resources,
     SET_COMPUTE_RESOURCES: SetResourcesFn = CSSetShaderResources => set_compute_resources,
     SET_VERTEX_RESOURCES: SetResourcesFn = VSSetShaderResources => set_vertex_resources,
@@ -111,6 +121,8 @@ hooks! {
     SET_HULL_RESOURCES: SetResourcesFn = HSSetShaderResources => set_hull_resources,
     SET_DOMAIN_RESOURCES: SetResourcesFn = DSSetShaderResources => set_domain_resources,
     COPY: CopyFn = CopyResource => copy_resource,
+    COPY_REGION: CopyRegionFn = CopySubresourceRegion => copy_region,
+    CLEAR_STATE: DrawAutoFn = ClearState => clear_state,
     DRAW: DrawFn = Draw => draw,
     DRAW_INDEXED: DrawIndexedFn = DrawIndexed => draw_indexed,
     DRAW_INSTANCED: DrawInstancedFn = DrawInstanced => draw_instanced,
@@ -128,14 +140,13 @@ static LAST_STENCIL_REF: AtomicU32 = AtomicU32::new(0);
 static LAST_RASTER: AtomicUsize = AtomicUsize::new(0);
 static LAST_VIEWPORTS: Mutex<Vec<D3D11_VIEWPORT>> = Mutex::new(Vec::new());
 static LAST_VERTEX_SHADER: Mutex<Option<ID3D11VertexShader>> = Mutex::new(None);
+static LAST_PIXEL_SHADER: Mutex<Option<ID3D11PixelShader>> = Mutex::new(None);
 static VERTEX_CONSTANT_SLOT: AtomicU32 = AtomicU32::new(u32::MAX);
 static LAST_DEPTH_VIEW: Mutex<Option<ID3D11DepthStencilView>> = Mutex::new(None);
 /// The engine's current depth state writes depth.
 static WRITES: AtomicBool = AtomicBool::new(true);
 /// The bound world target.
-static BOUND_TARGET: AtomicUsize = AtomicUsize::new(0);
-/// Per world target: written since its copy was last refreshed.
-static WRITTEN: [AtomicBool; 2] = [const { AtomicBool::new(true) }; 2];
+static BOUND_RESOURCE: AtomicUsize = AtomicUsize::new(0);
 static MIRRORED_DEPTH: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
 static MIRRORED_RASTER: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
 static DEPTH_WRITES: Mutex<Option<HashMap<usize, bool>>> = Mutex::new(None);
@@ -174,6 +185,8 @@ pub(crate) fn install() -> Result<(), String> {
     let context = immediate().ok_or("no immediate context")?;
     IMMEDIATE.store(context.as_raw() as usize, Ordering::Relaxed);
     create_vertex_constants(&device().ok_or("no device")?)?;
+    crate::copy::initialize(&device().ok_or("no device")?)?;
+    crate::copy::sync_sources();
     if let Some(device) = device()
         && let Err(e) = crate::shader::install_device(&device)
     {
@@ -201,45 +214,39 @@ pub(crate) fn install() -> Result<(), String> {
     Ok(())
 }
 
-/// The world target (scene depth or first-person) a depth view is of, whichever view object it is.
-fn world_target(view: *mut c_void) -> Option<usize> {
+fn depth_resource(view: *mut c_void) -> Option<ID3D11Resource> {
     let view = unsafe { ID3D11DepthStencilView::from_raw_borrowed(&view) }?;
-    let resource = unsafe { view.GetResource() }.ok()?;
-    WORLD_TARGETS
-        .into_iter()
-        .find(|&target| texture_of(target) == resource.as_raw() as usize)
-}
-
-fn written(target: usize) -> Option<&'static AtomicBool> {
-    WORLD_TARGETS
-        .iter()
-        .position(|&t| t == target)
-        .map(|k| &WRITTEN[k])
+    unsafe { view.GetResource() }.ok()
 }
 
 /// Refreshes a world target's copy when a written view of it was unbound, and sends the last states
 /// and vertex shader again once the bound depth view switched between world and other.
 fn bind(context: *mut c_void, view: *mut c_void) {
+    crate::copy::sync_sources();
     let next = unsafe { ID3D11DepthStencilView::from_raw_borrowed(&view) }.cloned();
     let previous = core::mem::replace(&mut *LAST_DEPTH_VIEW.lock().unwrap(), next);
     let previous_raw = previous
         .as_ref()
         .map_or(core::ptr::null_mut(), Interface::as_raw);
     if previous_raw != view
-        && let Some(t) = world_target(previous_raw)
-        && written(t).is_some_and(|w| w.load(Ordering::Relaxed))
+        && let Some(resource) = depth_resource(previous_raw)
     {
-        crate::copy::run(t);
+        let context = unsafe { ID3D11DeviceContext::from_raw_borrowed(&context) }.unwrap();
+        crate::copy::run(context, &resource);
     }
-    let target = world_target(view).filter(|_| crate::active());
-    if let Some(t) = target {
-        BOUND_TARGET.store(t, Ordering::Relaxed);
-    }
-    let bound = target.is_some();
+    let resource = depth_resource(view);
+    BOUND_RESOURCE.store(
+        resource
+            .as_ref()
+            .map_or(0, |resource| resource.as_raw() as usize),
+        Ordering::Relaxed,
+    );
+    let bound = resource.as_ref().is_some_and(crate::copy::reversed);
     if BOUND.swap(bound, Ordering::Relaxed) == bound {
         return;
     }
     let shader = LAST_VERTEX_SHADER.lock().unwrap().clone();
+    let pixel = LAST_PIXEL_SHADER.lock().unwrap().clone();
     unsafe {
         original(&SET_DEPTH_STATE)(
             context,
@@ -260,6 +267,16 @@ fn bind(context: *mut c_void, view: *mut c_void) {
             context,
             vertex_shader(
                 shader
+                    .as_ref()
+                    .map_or(core::ptr::null_mut(), Interface::as_raw),
+            ),
+            core::ptr::null(),
+            0,
+        );
+        original(&SET_PIXEL_SHADER)(
+            context,
+            pixel_shader(
+                pixel
                     .as_ref()
                     .map_or(core::ptr::null_mut(), Interface::as_raw),
             ),
@@ -328,7 +345,7 @@ pub(crate) fn draw_with_constants(
 
 macro_rules! immediate_only {
     ($original:ident, $context:ident $(, $argument:ident)*) => {
-        if $context as usize != IMMEDIATE.load(Ordering::Relaxed) {
+        if $context as usize != IMMEDIATE.load(Ordering::Relaxed) || crate::copy::internal() {
             unsafe { original(&$original)($context $(, $argument)*) };
             return;
         }
@@ -338,6 +355,7 @@ macro_rules! immediate_only {
 pub(crate) fn release_push_scale() {
     VERTEX_CONSTANTS.lock().unwrap().take();
     LAST_VERTEX_SHADER.lock().unwrap().take();
+    LAST_PIXEL_SHADER.lock().unwrap().take();
     LAST_DEPTH_VIEW.lock().unwrap().take();
 }
 
@@ -394,18 +412,6 @@ pub(crate) fn without_targets(context: &ID3D11DeviceContext, f: impl FnOnce()) {
             counters.as_ptr(),
         );
     };
-}
-
-pub(crate) fn mark_copied(target: usize) {
-    if let Some(w) = written(target) {
-        w.store(false, Ordering::Relaxed);
-    }
-}
-
-pub(crate) fn refresh_depth(target: usize) {
-    if written(target).is_some_and(|dirty| dirty.load(Ordering::Relaxed)) {
-        crate::copy::run(target);
-    }
 }
 
 unsafe extern "system" fn set_targets(
@@ -501,12 +507,11 @@ unsafe extern "system" fn clear_depth(
     stencil: u8,
 ) {
     immediate_only!(CLEAR_DEPTH, context, view, flags, depth, stencil);
-    let target = world_target(view).filter(|_| crate::active() && flags & D3D11_CLEAR_DEPTH != 0);
-    let mirror = target.is_some();
-    if let Some(w) = target.and_then(written) {
-        CLEARS.fetch_add(1, Ordering::Relaxed);
-        w.store(true, Ordering::Relaxed);
-    }
+    let resource = depth_resource(view);
+    let mirror = crate::active()
+        && resource.as_ref().is_some_and(|resource| {
+            crate::copy::seeded_world(resource) || crate::copy::reversed(resource)
+        });
     unsafe {
         original(&CLEAR_DEPTH)(
             context,
@@ -516,6 +521,17 @@ unsafe extern "system" fn clear_depth(
             stencil,
         );
     };
+    if flags & D3D11_CLEAR_DEPTH != 0
+        && let Some(resource) = resource
+    {
+        crate::copy::mark(&resource, mirror);
+        if mirror {
+            CLEARS.fetch_add(1, Ordering::Relaxed);
+        }
+        if resource.as_raw() as usize == BOUND_RESOURCE.load(Ordering::Relaxed) {
+            bind(context, view);
+        }
+    }
 }
 
 unsafe extern "system" fn set_vertex_shader(
@@ -536,6 +552,31 @@ unsafe extern "system" fn set_vertex_shader(
     unsafe { original(&SET_VERTEX_SHADER)(context, sent, instances, count) };
 }
 
+fn pixel_shader(shader: *mut c_void) -> *mut c_void {
+    if !BOUND.load(Ordering::Relaxed) || shader.is_null() {
+        return shader;
+    }
+    let original = unsafe { ID3D11PixelShader::from_raw_borrowed(&shader) }.unwrap();
+    crate::shader::pixel(original).map_or(shader, |twin| twin.as_raw())
+}
+
+unsafe extern "system" fn set_pixel_shader(
+    context: *mut c_void,
+    shader: *mut c_void,
+    instances: *const *mut c_void,
+    count: u32,
+) {
+    immediate_only!(SET_PIXEL_SHADER, context, shader, instances, count);
+    *LAST_PIXEL_SHADER.lock().unwrap() =
+        unsafe { ID3D11PixelShader::from_raw_borrowed(&shader) }.cloned();
+    let sent = if count == 0 {
+        pixel_shader(shader)
+    } else {
+        shader
+    };
+    unsafe { original(&SET_PIXEL_SHADER)(context, sent, instances, count) };
+}
+
 macro_rules! resource_hook {
     ($name:ident, $slot:ident) => {
         unsafe extern "system" fn $name(
@@ -545,7 +586,7 @@ macro_rules! resource_hook {
             views: *const *mut c_void,
         ) {
             immediate_only!($slot, context, start, count, views);
-            let swapped = substituted(count, views);
+            let swapped = substituted(context, count, views);
             unsafe {
                 original(&$slot)(
                     context,
@@ -565,18 +606,23 @@ resource_hook!(set_hull_resources, SET_HULL_RESOURCES);
 resource_hook!(set_domain_resources, SET_DOMAIN_RESOURCES);
 
 /// Shader views with a reversed depth target's own view replaced by its copy's.
-fn substituted(count: u32, views: *const *mut c_void) -> Option<Vec<*mut c_void>> {
+fn substituted(
+    context: *mut c_void,
+    count: u32,
+    views: *const *mut c_void,
+) -> Option<Vec<*mut c_void>> {
     if views.is_null() {
         return None;
     }
     let given = unsafe { core::slice::from_raw_parts(views, count as usize) };
+    let context = unsafe { ID3D11DeviceContext::from_raw_borrowed(&context) }.unwrap();
     given
         .iter()
-        .any(|&v| crate::copy::stand_in(v).is_some())
+        .any(|&v| crate::copy::stand_in(context, v).is_some())
         .then(|| {
             given
                 .iter()
-                .map(|&v| crate::copy::stand_in(v).unwrap_or(v))
+                .map(|&v| crate::copy::stand_in(context, v).unwrap_or(v))
                 .collect()
         })
 }
@@ -586,31 +632,130 @@ pub(crate) fn set_compute_resource_as_is(context: &ID3D11DeviceContext, view: *m
     unsafe { original(&SET_COMPUTE_RESOURCES)(context.as_raw(), 0, 1, &raw const view) };
 }
 
-fn texture_of(target: usize) -> usize {
-    target_field(target, TARGET_TEXTURE).map_or(0, |f| unsafe { *f })
-}
-
-/// After the engine copies the scene depth into another reversed target, that target's copy is
-/// refreshed.
 unsafe extern "system" fn copy_resource(context: *mut c_void, dst: *mut c_void, src: *mut c_void) {
     immediate_only!(COPY, context, dst, src);
     unsafe { original(&COPY)(context, dst, src) };
-    if crate::active()
-        && src as usize == texture_of(0)
-        && let Some(&t) = crate::copy::REVERSED_TARGETS
-            .iter()
-            .find(|&&t| t != 0 && texture_of(t) == dst as usize)
+    if let (Some(destination), Some(source), Some(context)) = unsafe {
+        (
+            ID3D11Resource::from_raw_borrowed(&dst),
+            ID3D11Resource::from_raw_borrowed(&src),
+            ID3D11DeviceContext::from_raw_borrowed(&context),
+        )
+    } {
+        crate::copy::copied(context, destination, source);
+        refresh_target_binding(context.as_raw(), destination.as_raw());
+    }
+}
+
+fn refresh_target_binding(context: *mut c_void, destination: *mut c_void) {
+    if destination as usize == BOUND_RESOURCE.load(Ordering::Relaxed) {
+        let view = LAST_DEPTH_VIEW.lock().unwrap().clone();
+        bind(
+            context,
+            view.as_ref()
+                .map_or(core::ptr::null_mut(), Interface::as_raw),
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe extern "system" fn copy_region(
+    context: *mut c_void,
+    destination: *mut c_void,
+    destination_subresource: u32,
+    x: u32,
+    y: u32,
+    z: u32,
+    source: *mut c_void,
+    source_subresource: u32,
+    region: *const windows::Win32::Graphics::Direct3D11::D3D11_BOX,
+) {
+    immediate_only!(
+        COPY_REGION,
+        context,
+        destination,
+        destination_subresource,
+        x,
+        y,
+        z,
+        source,
+        source_subresource,
+        region
+    );
+    let borrowed = unsafe {
+        (
+            ID3D11DeviceContext::from_raw_borrowed(&context),
+            ID3D11Resource::from_raw_borrowed(&destination),
+            ID3D11Resource::from_raw_borrowed(&source),
+        )
+    };
+    let empty = unsafe { region.as_ref() }.is_some_and(|region| {
+        region.left >= region.right || region.top >= region.bottom || region.front >= region.back
+    });
+    let mut track = !empty;
+    if !empty
+        && let (Some(context), Some(destination), Some(source)) = borrowed
+        && let Err(error) = crate::copy::prepare_region(
+            context,
+            destination,
+            source,
+            destination_subresource,
+            [x, y, z],
+            unsafe { region.as_ref() },
+        )
     {
-        crate::copy::run(t);
+        crate::copy::report(&error);
+        track = false;
+    }
+    unsafe {
+        original(&COPY_REGION)(
+            context,
+            destination,
+            destination_subresource,
+            x,
+            y,
+            z,
+            source,
+            source_subresource,
+            region,
+        );
+    };
+    if track && let (Some(context), Some(destination), Some(source)) = borrowed {
+        crate::copy::copied_region(context, destination, source);
+        refresh_target_binding(context.as_raw(), destination.as_raw());
+    }
+}
+
+unsafe extern "system" fn clear_state(context: *mut c_void) {
+    immediate_only!(CLEAR_STATE, context);
+    let previous = LAST_DEPTH_VIEW.lock().unwrap().take();
+    unsafe { original(&CLEAR_STATE)(context) };
+    BOUND.store(false, Ordering::Relaxed);
+    BOUND_RESOURCE.store(0, Ordering::Relaxed);
+    LAST_VERTEX_SHADER.lock().unwrap().take();
+    LAST_PIXEL_SHADER.lock().unwrap().take();
+    LAST_DEPTH_STATE.store(0, Ordering::Relaxed);
+    LAST_STENCIL_REF.store(0, Ordering::Relaxed);
+    LAST_RASTER.store(0, Ordering::Relaxed);
+    LAST_VIEWPORTS.lock().unwrap().clear();
+    VERTEX_CONSTANT_SLOT.store(u32::MAX, Ordering::Relaxed);
+    WRITES.store(true, Ordering::Relaxed);
+    if let Some(view) = previous
+        && let Ok(resource) = unsafe { view.GetResource() }
+    {
+        crate::copy::run(
+            unsafe { ID3D11DeviceContext::from_raw_borrowed(&context) }.unwrap(),
+            &resource,
+        );
     }
 }
 
 fn drawn() {
-    if BOUND.load(Ordering::Relaxed)
-        && WRITES.load(Ordering::Relaxed)
-        && let Some(w) = written(BOUND_TARGET.load(Ordering::Relaxed))
+    let resource = BOUND_RESOURCE.load(Ordering::Relaxed) as *mut c_void;
+    if WRITES.load(Ordering::Relaxed)
+        && let Some(resource) = unsafe { ID3D11Resource::from_raw_borrowed(&resource) }
     {
-        w.store(true, Ordering::Relaxed);
+        crate::copy::mark(resource, BOUND.load(Ordering::Relaxed));
     }
 }
 
@@ -832,11 +977,11 @@ pub(crate) fn counters() -> String {
         c.lock().unwrap().as_ref().map_or(0, HashMap::len)
     };
     format!(
-        "{}, depth state twins {}, raster twins {}, world depth clears {}, copies {}",
+        "{}, depth state twins {}, raster twins {}, world depth clears {}, {}",
         crate::shader::counters(),
         twins(&MIRRORED_DEPTH),
         twins(&MIRRORED_RASTER),
         CLEARS.load(Ordering::Relaxed),
-        crate::copy::count()
+        crate::copy::counters()
     )
 }
