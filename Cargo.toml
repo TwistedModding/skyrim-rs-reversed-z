@@ -1,0 +1,42 @@
+[workspace]
+resolver = "3"
+members = ["reversed-z"]
+exclude = ["extern"]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+publish = false
+
+[workspace.dependencies]
+skse = { path = "extern/skyrim-rs/crates/skse", version = "0.1.0" }
+sre = { path = "extern/skyrim-rs/crates/sre", version = "0.1.0", package = "skyrim-sre" }
+skyrim = { path = "extern/skyrim-rs/crates/skyrim", version = "0.1.0" }
+framework = { path = "extern/skyrim-rs/crates/framework", version = "0.1.0" }
+hook = { path = "extern/skyrim-rs/crates/hook", version = "0.1.0" }
+windows = "0.62"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = false
+strip = "symbols"
+
+# Iteration builds: release code without the LTO link.
+[profile.verify]
+inherits = "release"
+lto = "off"
+codegen-units = 16
+incremental = true

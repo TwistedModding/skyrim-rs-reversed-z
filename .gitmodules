@@ -1,0 +1,3 @@
+[submodule "extern/skyrim-rs"]
+	path = extern/skyrim-rs
+	url = ../skyrim-rs
