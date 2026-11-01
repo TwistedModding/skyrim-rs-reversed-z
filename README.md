@@ -22,7 +22,7 @@ Copy the package's `Data` folder over the game's (or install the package with a 
 
 Experimental support for stock Community Shaders 1.9.1 requires no CS patches. D3D11 WARP tests and in-game smoke tests cover Terrain Blending 1.2.0, Upscaling 1.4.0, distant mountains, Riverwood, first-person hands and the Sleeping Giant Inn. The tested paths reported no shader rewrite failures, missing bytecode or unsupported depth copies. Other feature combinations and DLSS modes have not been validated.
 
-With RS Improved Camera and CS, set `compat = stack` in `Data\SKSE\Plugins\skyrim-rs.ini` and restart. The loader's default `refuse` policy disables IC callbacks after CS wraps their hooks; stack mode preserves body-part hiding.
+With RS Improved Camera and CS, use the skyrim-rs loader with API 5 or newer (reported in `skyrim-rs.log`). Hook chaining is the default and preserves IC body-part hiding without an INI change. An explicit `compat = refuse` setting disables chaining globally. Earlier loaders require `compat = stack` in `Data\SKSE\Plugins\skyrim-rs.ini`.
 
 `ReversedZ off` keeps the D32 depth targets created at startup. With Community Shaders, a translucent riverbank band can appear in this mode; the original DLL also reproduces it. For a stock depth-format comparison, disable this mod and restart the game.
 
