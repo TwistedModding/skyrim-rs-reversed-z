@@ -20,7 +20,11 @@ Copy the package's `Data` folder over the game's (or install the package with a 
 
 ## Community Shaders
 
-Community Shaders compatibility is experimental. All changes are in this plugin: it captures vertex and pixel shaders through Direct3D, preserves conventional pixel depth, and tracks textures copied from world depth. Synthetic D3D11 WARP tests pass. Stock Community Shaders 1.9.1 runs with Terrain Blending and Upscaling, with no reported shader rewrite failures or unsupported depth copies in the tested exterior scenes. Visual validation is incomplete: a riverbank difference between Reversed-Z on and off is still under investigation.
+Experimental support for stock Community Shaders 1.9.1 requires no CS patches. D3D11 WARP tests and in-game smoke tests cover Terrain Blending 1.2.0, Upscaling 1.4.0, distant mountains, Riverwood, first-person hands and the Sleeping Giant Inn. The tested paths reported no shader rewrite failures, missing bytecode or unsupported depth copies. Other feature combinations and DLSS modes have not been validated.
+
+With RS Improved Camera and CS, set `compat = stack` in `Data\SKSE\Plugins\skyrim-rs.ini` and restart. The loader's default `refuse` policy disables IC callbacks after CS wraps their hooks; stack mode preserves body-part hiding.
+
+`ReversedZ off` keeps the D32 depth targets created at startup. With Community Shaders, a translucent riverbank band can appear in this mode; the original DLL also reproduces it. For a stock depth-format comparison, disable this mod and restart the game.
 
 ## Build and package
 
