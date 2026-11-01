@@ -21,9 +21,9 @@ Copy the package's `Data` folder over the game's (or install the package with a 
 ## Build and package
 
 ```
-git submodule update --init
+git clone --recurse-submodules https://github.com/TwistedModding/skyrim-rs-reversed-z.git
 cargo build --release
 powershell -File scripts\package.ps1
 ```
 
-The DLL lands in `target\release\`; `scripts\package.ps1` builds it and writes `dist\skyrim-rs-reversed-z-<version>.zip` with the DLL at its install path and this README. `CLAUDE.md` explains the skyrim-rs submodule. How it works is in `reversed-z/src/lib.rs`; its state and in-game findings are in `docs/STATUS.md`.
+skyrim-rs is a submodule at `extern/skyrim-rs` (`git submodule update --init` in an existing clone). The DLL lands in `target\release\`; the package script writes `dist\skyrim-rs-reversed-z-<version>.zip` with the DLL at its install path and this README.
