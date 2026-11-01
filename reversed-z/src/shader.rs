@@ -292,9 +292,11 @@ fn mirror<S: Interface + core::ops::Deref<Target = ID3D11DeviceChild>>(
     }
     let Some(code) = bytecode(shader).or_else(fallback) else {
         if MISSED.fetch_add(1, Ordering::Relaxed) == 0 {
-            crate::log(
-                "world shader bytecode unavailable; shaders created before capture may not be reversed",
-            );
+            crate::log(if vertex {
+                "world vertex shader bytecode unavailable; shaders created before capture may not be reversed"
+            } else {
+                "world pixel shader bytecode unavailable; shaders created before capture may not be reversed"
+            });
         }
         return None;
     };

@@ -65,6 +65,7 @@ pub(crate) fn active() -> bool {
 }
 
 fn address(id: u64) -> Option<usize> {
+    HOST.get()?;
     skyrim::reloc().address(id).ok()
 }
 

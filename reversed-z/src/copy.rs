@@ -868,6 +868,7 @@ pub(crate) mod tests {
             "an existing standard view must refresh when the source changes convention"
         );
         partial_copy(device, context, depth_desc, &input);
+        crate::context::test_shader_readback(device, context, &depth_view);
         release();
         crate::context::remove();
     }

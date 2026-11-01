@@ -40,6 +40,8 @@ type SetRasterFn = unsafe extern "system" fn(*mut c_void, *mut c_void);
 type SetViewportsFn = unsafe extern "system" fn(*mut c_void, u32, *const D3D11_VIEWPORT);
 type ClearDepthFn = unsafe extern "system" fn(*mut c_void, *mut c_void, u32, f32, u8);
 type SetShaderFn = unsafe extern "system" fn(*mut c_void, *mut c_void, *const *mut c_void, u32);
+type GetShaderFn =
+    unsafe extern "system" fn(*mut c_void, *mut *mut c_void, *mut *mut c_void, *mut u32);
 type CopyFn = unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void);
 type CopyRegionFn = unsafe extern "system" fn(
     *mut c_void,
@@ -102,6 +104,7 @@ macro_rules! hooks {
 
 #[cfg(test)]
 pub(crate) fn install_test_hooks(context: &ID3D11DeviceContext) {
+    IMMEDIATE.store(context.as_raw() as usize, Ordering::Relaxed);
     install_hooks(context.vtable()).unwrap();
 }
 
@@ -114,6 +117,8 @@ hooks! {
     CLEAR_DEPTH: ClearDepthFn = ClearDepthStencilView => clear_depth,
     SET_VERTEX_SHADER: SetShaderFn = VSSetShader => set_vertex_shader,
     SET_PIXEL_SHADER: SetShaderFn = PSSetShader => set_pixel_shader,
+    GET_VERTEX_SHADER: GetShaderFn = VSGetShader => get_vertex_shader,
+    GET_PIXEL_SHADER: GetShaderFn = PSGetShader => get_pixel_shader,
     SET_PIXEL_RESOURCES: SetResourcesFn = PSSetShaderResources => set_pixel_resources,
     SET_COMPUTE_RESOURCES: SetResourcesFn = CSSetShaderResources => set_compute_resources,
     SET_VERTEX_RESOURCES: SetResourcesFn = VSSetShaderResources => set_vertex_resources,
@@ -141,6 +146,10 @@ static LAST_RASTER: AtomicUsize = AtomicUsize::new(0);
 static LAST_VIEWPORTS: Mutex<Vec<D3D11_VIEWPORT>> = Mutex::new(Vec::new());
 static LAST_VERTEX_SHADER: Mutex<Option<ID3D11VertexShader>> = Mutex::new(None);
 static LAST_PIXEL_SHADER: Mutex<Option<ID3D11PixelShader>> = Mutex::new(None);
+static VERTEX_INSTANCES: AtomicU32 = AtomicU32::new(0);
+static PIXEL_INSTANCES: AtomicU32 = AtomicU32::new(0);
+static DRAWING: AtomicBool = AtomicBool::new(false);
+static DEPTH_TESTS: AtomicBool = AtomicBool::new(true);
 static VERTEX_CONSTANT_SLOT: AtomicU32 = AtomicU32::new(u32::MAX);
 static LAST_DEPTH_VIEW: Mutex<Option<ID3D11DepthStencilView>> = Mutex::new(None);
 /// The engine's current depth state writes depth.
@@ -149,7 +158,7 @@ static WRITES: AtomicBool = AtomicBool::new(true);
 static BOUND_RESOURCE: AtomicUsize = AtomicUsize::new(0);
 static MIRRORED_DEPTH: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
 static MIRRORED_RASTER: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
-static DEPTH_WRITES: Mutex<Option<HashMap<usize, bool>>> = Mutex::new(None);
+static DEPTH_MODES: Mutex<Option<HashMap<usize, (bool, bool)>>> = Mutex::new(None);
 struct VertexConstants {
     buffer: ID3D11Buffer,
     sent: [u32; 4],
@@ -167,6 +176,10 @@ pub(crate) fn original<F: Copy>(slot: &Mutex<Option<hook::Hook<F>>>) -> F {
 }
 
 pub(crate) fn device() -> Option<ID3D11Device> {
+    let context = IMMEDIATE.load(Ordering::Relaxed) as *mut c_void;
+    if let Some(context) = unsafe { ID3D11DeviceContext::from_raw_borrowed(&context) } {
+        return unsafe { context.GetDevice() }.ok();
+    }
     let p = unsafe { *(crate::address(globals::g_D3D11Device)? as *const *mut c_void) };
     unsafe { ID3D11Device::from_raw_borrowed(&p) }.cloned()
 }
@@ -245,8 +258,6 @@ fn bind(context: *mut c_void, view: *mut c_void) {
     if BOUND.swap(bound, Ordering::Relaxed) == bound {
         return;
     }
-    let shader = LAST_VERTEX_SHADER.lock().unwrap().clone();
-    let pixel = LAST_PIXEL_SHADER.lock().unwrap().clone();
     unsafe {
         original(&SET_DEPTH_STATE)(
             context,
@@ -263,26 +274,58 @@ fn bind(context: *mut c_void, view: *mut c_void) {
             u32::try_from(viewports.len()).unwrap_or(0),
             viewports.as_ptr(),
         );
-        original(&SET_VERTEX_SHADER)(
-            context,
-            vertex_shader(
-                shader
-                    .as_ref()
-                    .map_or(core::ptr::null_mut(), Interface::as_raw),
-            ),
-            core::ptr::null(),
-            0,
-        );
-        original(&SET_PIXEL_SHADER)(
-            context,
-            pixel_shader(
-                pixel
-                    .as_ref()
-                    .map_or(core::ptr::null_mut(), Interface::as_raw),
-            ),
-            core::ptr::null(),
-            0,
-        );
+    }
+}
+
+fn with_shaders(context: *mut c_void, draw: impl FnOnce()) {
+    if !BOUND.load(Ordering::Relaxed) || !DEPTH_TESTS.load(Ordering::Relaxed) {
+        draw();
+        return;
+    }
+    let vertex = LAST_VERTEX_SHADER.lock().unwrap().clone();
+    let pixel = LAST_PIXEL_SHADER.lock().unwrap().clone();
+    let sources = [
+        vertex
+            .as_ref()
+            .map_or(core::ptr::null_mut(), Interface::as_raw),
+        pixel
+            .as_ref()
+            .map_or(core::ptr::null_mut(), Interface::as_raw),
+    ];
+    let stages = [
+        (
+            &SET_VERTEX_SHADER,
+            &VERTEX_INSTANCES,
+            vertex_shader as fn(*mut c_void) -> *mut c_void,
+        ),
+        (
+            &SET_PIXEL_SHADER,
+            &PIXEL_INSTANCES,
+            pixel_shader as fn(*mut c_void) -> *mut c_void,
+        ),
+    ];
+    let previous = DRAWING.swap(true, Ordering::Relaxed);
+    let mut changed = [false; 2];
+    VERTEX_CONSTANT_SLOT.store(u32::MAX, Ordering::Relaxed);
+    for (i, (hook, instances, rewrite)) in stages.iter().enumerate() {
+        if instances.load(Ordering::Relaxed) != 0 {
+            crate::copy::report("dynamic shader linkage is unsupported for reversed depth");
+        } else if !sources[i].is_null() {
+            unsafe { original(hook)(context, rewrite(sources[i]), core::ptr::null(), 0) };
+            changed[i] = true;
+        }
+    }
+    with_vertex_constants(context, draw);
+    DRAWING.store(previous, Ordering::Relaxed);
+    for (i, (hook, _, _)) in stages.iter().enumerate() {
+        if changed[i] {
+            let source = if previous {
+                stages[i].2(sources[i])
+            } else {
+                sources[i]
+            };
+            unsafe { original(hook)(context, source, core::ptr::null(), 0) };
+        }
     }
 }
 
@@ -464,8 +507,26 @@ unsafe extern "system" fn set_depth_state(
     immediate_only!(SET_DEPTH_STATE, context, state, stencil_ref);
     LAST_DEPTH_STATE.store(state as usize, Ordering::Relaxed);
     LAST_STENCIL_REF.store(stencil_ref, Ordering::Relaxed);
-    WRITES.store(writes_depth(state), Ordering::Relaxed);
+    let (tests, writes) = depth_mode(state);
+    let changed = DEPTH_TESTS.swap(tests, Ordering::Relaxed) != tests;
+    WRITES.store(writes, Ordering::Relaxed);
     unsafe { original(&SET_DEPTH_STATE)(context, depth_state(state), stencil_ref) };
+    if changed && BOUND.load(Ordering::Relaxed) {
+        unsafe {
+            original(&SET_RASTER)(
+                context,
+                raster(LAST_RASTER.load(Ordering::Relaxed) as *mut c_void),
+            );
+        };
+        let viewports = viewports(&LAST_VIEWPORTS.lock().unwrap());
+        unsafe {
+            original(&SET_VIEWPORTS)(
+                context,
+                u32::try_from(viewports.len()).unwrap(),
+                viewports.as_ptr(),
+            );
+        };
+    }
 }
 
 unsafe extern "system" fn set_raster(context: *mut c_void, state: *mut c_void) {
@@ -543,7 +604,8 @@ unsafe extern "system" fn set_vertex_shader(
     immediate_only!(SET_VERTEX_SHADER, context, shader, instances, count);
     *LAST_VERTEX_SHADER.lock().unwrap() =
         unsafe { ID3D11VertexShader::from_raw_borrowed(&shader) }.cloned();
-    let sent = if count == 0 {
+    VERTEX_INSTANCES.store(count, Ordering::Relaxed);
+    let sent = if count == 0 && DRAWING.load(Ordering::Relaxed) {
         vertex_shader(shader)
     } else {
         VERTEX_CONSTANT_SLOT.store(u32::MAX, Ordering::Relaxed);
@@ -569,12 +631,140 @@ unsafe extern "system" fn set_pixel_shader(
     immediate_only!(SET_PIXEL_SHADER, context, shader, instances, count);
     *LAST_PIXEL_SHADER.lock().unwrap() =
         unsafe { ID3D11PixelShader::from_raw_borrowed(&shader) }.cloned();
-    let sent = if count == 0 {
+    PIXEL_INSTANCES.store(count, Ordering::Relaxed);
+    let sent = if count == 0 && DRAWING.load(Ordering::Relaxed) {
         pixel_shader(shader)
     } else {
         shader
     };
     unsafe { original(&SET_PIXEL_SHADER)(context, sent, instances, count) };
+}
+
+macro_rules! shader_getter {
+    ($name:ident, $hook:ident, $last:ident, $shader:ty) => {
+        unsafe extern "system" fn $name(
+            context: *mut c_void,
+            shader: *mut *mut c_void,
+            instances: *mut *mut c_void,
+            count: *mut u32,
+        ) {
+            immediate_only!($hook, context, shader, instances, count);
+            unsafe { original(&$hook)(context, shader, instances, count) };
+            if DRAWING.load(Ordering::Relaxed) && !shader.is_null() {
+                let logical = $last.lock().unwrap().clone();
+                if !unsafe { *shader }.is_null() {
+                    drop(unsafe { <$shader>::from_raw(*shader) });
+                }
+                unsafe { *shader = logical.map_or(core::ptr::null_mut(), Interface::into_raw) };
+            }
+        }
+    };
+}
+shader_getter!(
+    get_vertex_shader,
+    GET_VERTEX_SHADER,
+    LAST_VERTEX_SHADER,
+    ID3D11VertexShader
+);
+shader_getter!(
+    get_pixel_shader,
+    GET_PIXEL_SHADER,
+    LAST_PIXEL_SHADER,
+    ID3D11PixelShader
+);
+
+#[cfg(test)]
+pub(crate) fn test_shader_readback(
+    device: &ID3D11Device,
+    context: &ID3D11DeviceContext,
+    depth: &ID3D11DepthStencilView,
+) {
+    let code = crate::twin::tests::compile(crate::twin::tests::CONSTANT);
+    let mut vertex = None;
+    unsafe { device.CreateVertexShader(&code, None, Some(&raw mut vertex)) }.unwrap();
+    let vertex = vertex.unwrap();
+    let code = crate::twin::tests::compile_stage(
+        "float4 main(float4 p : SV_Position) : SV_Target { return p.zzzz; }",
+        windows::core::s!("ps_5_0"),
+    );
+    let mut pixel = None;
+    unsafe { device.CreatePixelShader(&code, None, Some(&raw mut pixel)) }.unwrap();
+    let pixel = pixel.unwrap();
+    crate::copy::mark(&unsafe { depth.GetResource() }.unwrap(), true);
+    unsafe {
+        context.VSSetShader(&vertex, None);
+        context.PSSetShader(&pixel, None);
+        context.OMSetRenderTargets(None, depth);
+    }
+    macro_rules! check {
+        ($get:ident, $set:ident, $hook:ident, $expected:ident, $shader:ty) => {
+            let mut restored = None;
+            unsafe { context.$get(&raw mut restored, None, None) };
+            assert_eq!(
+                restored.as_ref().map(Interface::as_raw),
+                Some($expected.as_raw())
+            );
+            unsafe { context.$set(restored.as_ref(), None) };
+            let mut native = core::ptr::null_mut();
+            unsafe {
+                original(&$hook)(
+                    context.as_raw(),
+                    &raw mut native,
+                    core::ptr::null_mut(),
+                    core::ptr::null_mut(),
+                )
+            };
+            let native = unsafe { <$shader>::from_raw(native) };
+            assert_ne!(native.as_raw(), $expected.as_raw());
+        };
+    }
+    with_shaders(context.as_raw(), || {
+        with_shaders(context.as_raw(), || {
+            check!(
+                VSGetShader,
+                VSSetShader,
+                GET_VERTEX_SHADER,
+                vertex,
+                ID3D11VertexShader
+            );
+            check!(
+                PSGetShader,
+                PSSetShader,
+                GET_PIXEL_SHADER,
+                pixel,
+                ID3D11PixelShader
+            );
+        });
+        check!(
+            VSGetShader,
+            VSSetShader,
+            GET_VERTEX_SHADER,
+            vertex,
+            ID3D11VertexShader
+        );
+        check!(
+            PSGetShader,
+            PSSetShader,
+            GET_PIXEL_SHADER,
+            pixel,
+            ID3D11PixelShader
+        );
+    });
+    let mut restored_vertex = None;
+    let mut restored_pixel = None;
+    unsafe {
+        context.VSGetShader(&raw mut restored_vertex, None, None);
+        context.PSGetShader(&raw mut restored_pixel, None, None);
+    }
+    assert_eq!(
+        restored_vertex.as_ref().map(Interface::as_raw),
+        Some(vertex.as_raw())
+    );
+    assert_eq!(
+        restored_pixel.as_ref().map(Interface::as_raw),
+        Some(pixel.as_raw())
+    );
+    unsafe { context.ClearState() };
 }
 
 macro_rules! resource_hook {
@@ -740,6 +930,9 @@ unsafe extern "system" fn clear_state(context: *mut c_void) {
     LAST_VIEWPORTS.lock().unwrap().clear();
     VERTEX_CONSTANT_SLOT.store(u32::MAX, Ordering::Relaxed);
     WRITES.store(true, Ordering::Relaxed);
+    DEPTH_TESTS.store(true, Ordering::Relaxed);
+    VERTEX_INSTANCES.store(0, Ordering::Relaxed);
+    PIXEL_INSTANCES.store(0, Ordering::Relaxed);
     if let Some(view) = previous
         && let Ok(resource) = unsafe { view.GetResource() }
     {
@@ -762,7 +955,7 @@ fn drawn() {
 unsafe extern "system" fn draw(context: *mut c_void, vertices: u32, start: u32) {
     immediate_only!(DRAW, context, vertices, start);
     drawn();
-    with_vertex_constants(context, || unsafe {
+    with_shaders(context, || unsafe {
         original(&DRAW)(context, vertices, start);
     });
 }
@@ -770,7 +963,7 @@ unsafe extern "system" fn draw(context: *mut c_void, vertices: u32, start: u32) 
 unsafe extern "system" fn draw_indexed(context: *mut c_void, indices: u32, start: u32, base: i32) {
     immediate_only!(DRAW_INDEXED, context, indices, start, base);
     drawn();
-    with_vertex_constants(context, || unsafe {
+    with_shaders(context, || unsafe {
         original(&DRAW_INDEXED)(context, indices, start, base);
     });
 }
@@ -784,7 +977,7 @@ unsafe extern "system" fn draw_instanced(
 ) {
     immediate_only!(DRAW_INSTANCED, context, vertices, instances, start, first);
     drawn();
-    with_vertex_constants(context, || unsafe {
+    with_shaders(context, || unsafe {
         original(&DRAW_INSTANCED)(context, vertices, instances, start, first);
     });
 }
@@ -807,7 +1000,7 @@ unsafe extern "system" fn draw_indexed_instanced(
         first
     );
     drawn();
-    with_vertex_constants(context, || unsafe {
+    with_shaders(context, || unsafe {
         original(&DRAW_INDEXED_INSTANCED)(context, indices, instances, start, base, first);
     });
 }
@@ -815,7 +1008,7 @@ unsafe extern "system" fn draw_indexed_instanced(
 unsafe extern "system" fn draw_indirect(context: *mut c_void, arguments: *mut c_void, offset: u32) {
     immediate_only!(DRAW_INDIRECT, context, arguments, offset);
     drawn();
-    with_vertex_constants(context, || unsafe {
+    with_shaders(context, || unsafe {
         original(&DRAW_INDIRECT)(context, arguments, offset);
     });
 }
@@ -827,7 +1020,7 @@ unsafe extern "system" fn draw_indexed_indirect(
 ) {
     immediate_only!(DRAW_INDEXED_INDIRECT, context, arguments, offset);
     drawn();
-    with_vertex_constants(context, || unsafe {
+    with_shaders(context, || unsafe {
         original(&DRAW_INDEXED_INDIRECT)(context, arguments, offset);
     });
 }
@@ -835,11 +1028,11 @@ unsafe extern "system" fn draw_indexed_indirect(
 unsafe extern "system" fn draw_auto(context: *mut c_void) {
     immediate_only!(DRAW_AUTO, context);
     drawn();
-    with_vertex_constants(context, || unsafe { original(&DRAW_AUTO)(context) });
+    with_shaders(context, || unsafe { original(&DRAW_AUTO)(context) });
 }
 
 fn viewports(given: &[D3D11_VIEWPORT]) -> Vec<D3D11_VIEWPORT> {
-    let bound = BOUND.load(Ordering::Relaxed);
+    let bound = BOUND.load(Ordering::Relaxed) && DEPTH_TESTS.load(Ordering::Relaxed);
     given
         .iter()
         .map(|v| {
@@ -887,18 +1080,21 @@ fn vertex_shader(shader: *mut c_void) -> *mut c_void {
     })
 }
 
-fn writes_depth(state: *mut c_void) -> bool {
-    let mut cache = DEPTH_WRITES.lock().unwrap();
+fn depth_mode(state: *mut c_void) -> (bool, bool) {
+    let mut cache = DEPTH_MODES.lock().unwrap();
     *cache
         .get_or_insert_with(HashMap::new)
         .entry(state as usize)
         .or_insert_with(|| {
             let Some(s) = (unsafe { ID3D11DepthStencilState::from_raw_borrowed(&state) }) else {
-                return true;
+                return (true, true);
             };
             let mut desc = D3D11_DEPTH_STENCIL_DESC::default();
             unsafe { s.GetDesc(&raw mut desc) };
-            desc.DepthEnable.as_bool() && desc.DepthWriteMask == D3D11_DEPTH_WRITE_MASK_ALL
+            (
+                desc.DepthEnable.as_bool(),
+                desc.DepthEnable.as_bool() && desc.DepthWriteMask == D3D11_DEPTH_WRITE_MASK_ALL,
+            )
         })
 }
 
@@ -914,7 +1110,7 @@ fn mirrored_func(f: D3D11_COMPARISON_FUNC) -> D3D11_COMPARISON_FUNC {
 
 /// The state to send: the engine's, or its mirrored twin while a world view is bound.
 fn depth_state(state: *mut c_void) -> *mut c_void {
-    if !BOUND.load(Ordering::Relaxed) {
+    if !BOUND.load(Ordering::Relaxed) || !DEPTH_TESTS.load(Ordering::Relaxed) {
         return state;
     }
     twin(&MIRRORED_DEPTH, state, |device| {
@@ -936,7 +1132,7 @@ fn depth_state(state: *mut c_void) -> *mut c_void {
 
 fn raster(state: *mut c_void) -> *mut c_void {
     let Some(s) = unsafe { ID3D11RasterizerState::from_raw_borrowed(&state) }
-        .filter(|_| BOUND.load(Ordering::Relaxed))
+        .filter(|_| BOUND.load(Ordering::Relaxed) && DEPTH_TESTS.load(Ordering::Relaxed))
     else {
         return state;
     };
