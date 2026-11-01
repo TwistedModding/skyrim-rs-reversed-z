@@ -18,7 +18,7 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_DEPTH_STENCIL_DESC, D3D11_DEPTH_STENCIL_VIEW_DESC, D3D11_DEPTH_WRITE_MASK_ALL,
     D3D11_RASTERIZER_DESC, D3D11_USAGE_DEFAULT, D3D11_VIEWPORT, ID3D11Buffer,
     ID3D11DepthStencilState, ID3D11DepthStencilView, ID3D11Device, ID3D11DeviceContext,
-    ID3D11RasterizerState, ID3D11RenderTargetView, ID3D11VertexShader,
+    ID3D11RasterizerState, ID3D11RenderTargetView, ID3D11UnorderedAccessView, ID3D11VertexShader,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
 use windows::core::Interface;
@@ -53,7 +53,6 @@ type DrawAutoFn = unsafe extern "system" fn(*mut c_void);
 const TARGET_STRIDE: usize = 0x98;
 pub(crate) const TARGET_TEXTURE: usize = 0x2018;
 const TARGET_VIEW: usize = 0x2020;
-const TARGET_READ_ONLY_VIEW: usize = 0x2060;
 pub(crate) const TARGET_SHADER_VIEW: usize = 0x20a0;
 /// The depth targets the world cameras draw into: the scene depth and the first-person copy.
 const WORLD_TARGETS: [usize; 2] = [0, 7];
@@ -92,6 +91,11 @@ macro_rules! hooks {
     };
 }
 
+#[cfg(test)]
+pub(crate) fn install_test_hooks(context: &ID3D11DeviceContext) {
+    install_hooks(context.vtable()).unwrap();
+}
+
 hooks! {
     SET_TARGETS: SetTargetsFn = OMSetRenderTargets => set_targets,
     SET_TARGETS_UAV: SetTargetsUavFn = OMSetRenderTargetsAndUnorderedAccessViews => set_targets_uav,
@@ -102,6 +106,10 @@ hooks! {
     SET_VERTEX_SHADER: SetShaderFn = VSSetShader => set_vertex_shader,
     SET_PIXEL_RESOURCES: SetResourcesFn = PSSetShaderResources => set_pixel_resources,
     SET_COMPUTE_RESOURCES: SetResourcesFn = CSSetShaderResources => set_compute_resources,
+    SET_VERTEX_RESOURCES: SetResourcesFn = VSSetShaderResources => set_vertex_resources,
+    SET_GEOMETRY_RESOURCES: SetResourcesFn = GSSetShaderResources => set_geometry_resources,
+    SET_HULL_RESOURCES: SetResourcesFn = HSSetShaderResources => set_hull_resources,
+    SET_DOMAIN_RESOURCES: SetResourcesFn = DSSetShaderResources => set_domain_resources,
     COPY: CopyFn = CopyResource => copy_resource,
     DRAW: DrawFn = Draw => draw,
     DRAW_INDEXED: DrawIndexedFn = DrawIndexed => draw_indexed,
@@ -113,8 +121,6 @@ hooks! {
 }
 
 static IMMEDIATE: AtomicUsize = AtomicUsize::new(0);
-static WORLD_VIEWS: [AtomicUsize; 4] = [const { AtomicUsize::new(0) }; 4];
-static KNOWN_VIEWS: Mutex<Option<HashMap<usize, Option<usize>>>> = Mutex::new(None);
 /// A world depth view is bound and the calls sent to the context are mirrored.
 static BOUND: AtomicBool = AtomicBool::new(false);
 static LAST_DEPTH_STATE: AtomicUsize = AtomicUsize::new(0);
@@ -123,7 +129,7 @@ static LAST_RASTER: AtomicUsize = AtomicUsize::new(0);
 static LAST_VIEWPORTS: Mutex<Vec<D3D11_VIEWPORT>> = Mutex::new(Vec::new());
 static LAST_VERTEX_SHADER: Mutex<Option<ID3D11VertexShader>> = Mutex::new(None);
 static VERTEX_CONSTANT_SLOT: AtomicU32 = AtomicU32::new(u32::MAX);
-static LAST_DEPTH_VIEW: AtomicUsize = AtomicUsize::new(0);
+static LAST_DEPTH_VIEW: Mutex<Option<ID3D11DepthStencilView>> = Mutex::new(None);
 /// The engine's current depth state writes depth.
 static WRITES: AtomicBool = AtomicBool::new(true);
 /// The bound world target.
@@ -177,15 +183,7 @@ pub(crate) fn install() -> Result<(), String> {
         crate::address(globals::g_CurrentCameraState).ok_or("no camera state")?,
         Ordering::Relaxed,
     );
-    for (i, (target, offset)) in WORLD_TARGETS
-        .iter()
-        .flat_map(|t| [(*t, TARGET_VIEW), (*t, TARGET_READ_ONLY_VIEW)])
-        .enumerate()
-    {
-        let view = unsafe { *target_field(target, offset).ok_or("no renderer")? };
-        WORLD_VIEWS[i].store(view, Ordering::Relaxed);
-    }
-    let view = WORLD_VIEWS[0].load(Ordering::Relaxed) as *mut c_void;
+    let view = unsafe { *target_field(0, TARGET_VIEW).ok_or("no renderer")? } as *mut c_void;
     let view = unsafe { ID3D11DepthStencilView::from_raw_borrowed(&view) }
         .ok_or("the world depth target has no view")?;
     let mut desc = D3D11_DEPTH_STENCIL_VIEW_DESC::default();
@@ -205,29 +203,11 @@ pub(crate) fn install() -> Result<(), String> {
 
 /// The world target (scene depth or first-person) a depth view is of, whichever view object it is.
 fn world_target(view: *mut c_void) -> Option<usize> {
-    if view.is_null() {
-        return None;
-    }
-    if let Some(i) = WORLD_VIEWS
-        .iter()
-        .position(|v| v.load(Ordering::Relaxed) == view as usize)
-    {
-        return Some(WORLD_TARGETS[i / 2]);
-    }
-    let mut known = KNOWN_VIEWS.lock().unwrap();
-    *known
-        .get_or_insert_with(HashMap::new)
-        .entry(view as usize)
-        .or_insert_with(|| {
-            let texture = unsafe { ID3D11DepthStencilView::from_raw_borrowed(&view) }
-                .and_then(|v| unsafe { v.GetResource() }.ok())
-                .map(|r| r.as_raw());
-            WORLD_TARGETS.into_iter().find(|&i| {
-                texture.is_some_and(|t| {
-                    target_field(i, TARGET_TEXTURE).is_some_and(|f| unsafe { *f } == t as usize)
-                })
-            })
-        })
+    let view = unsafe { ID3D11DepthStencilView::from_raw_borrowed(&view) }?;
+    let resource = unsafe { view.GetResource() }.ok()?;
+    WORLD_TARGETS
+        .into_iter()
+        .find(|&target| texture_of(target) == resource.as_raw() as usize)
 }
 
 fn written(target: usize) -> Option<&'static AtomicBool> {
@@ -240,9 +220,13 @@ fn written(target: usize) -> Option<&'static AtomicBool> {
 /// Refreshes a world target's copy when a written view of it was unbound, and sends the last states
 /// and vertex shader again once the bound depth view switched between world and other.
 fn bind(context: *mut c_void, view: *mut c_void) {
-    let previous = LAST_DEPTH_VIEW.swap(view as usize, Ordering::Relaxed) as *mut c_void;
-    if previous != view
-        && let Some(t) = world_target(previous)
+    let next = unsafe { ID3D11DepthStencilView::from_raw_borrowed(&view) }.cloned();
+    let previous = core::mem::replace(&mut *LAST_DEPTH_VIEW.lock().unwrap(), next);
+    let previous_raw = previous
+        .as_ref()
+        .map_or(core::ptr::null_mut(), Interface::as_raw);
+    if previous_raw != view
+        && let Some(t) = world_target(previous_raw)
         && written(t).is_some_and(|w| w.load(Ordering::Relaxed))
     {
         crate::copy::run(t);
@@ -354,6 +338,7 @@ macro_rules! immediate_only {
 pub(crate) fn release_push_scale() {
     VERTEX_CONSTANTS.lock().unwrap().take();
     LAST_VERTEX_SHADER.lock().unwrap().take();
+    LAST_DEPTH_VIEW.lock().unwrap().take();
 }
 
 /// Runs `f` with no output targets bound, past the bind bookkeeping, and binds them again after.
@@ -361,21 +346,40 @@ pub(crate) fn without_targets(context: &ID3D11DeviceContext, f: impl FnOnce()) {
     let mut views: [Option<ID3D11RenderTargetView>; 8] = Default::default();
     let mut depth: Option<ID3D11DepthStencilView> = None;
     unsafe { context.OMGetRenderTargets(Some(&mut views), Some(&raw mut depth)) };
-    let set = original(&SET_TARGETS);
+    let count = views.iter().rposition(Option::is_some).map_or(0, |i| i + 1);
+    let mut unordered: [Option<ID3D11UnorderedAccessView>; 8] = Default::default();
+    if count < 8 {
+        unsafe {
+            context.OMGetRenderTargetsAndUnorderedAccessViews(
+                None,
+                None,
+                u32::try_from(count).unwrap(),
+                Some(&mut unordered[count..]),
+            );
+        };
+    }
+    let set = original(&SET_TARGETS_UAV);
+    let empty = [core::ptr::null_mut(); 8];
     unsafe {
         set(
             context.as_raw(),
             0,
             core::ptr::null(),
             core::ptr::null_mut(),
+            0,
+            8,
+            empty.as_ptr(),
+            core::ptr::null(),
         );
     };
     f();
-    let raw: Vec<*mut c_void> = views
-        .iter()
-        .map(|v| v.as_ref().map_or(core::ptr::null_mut(), Interface::as_raw))
-        .collect();
-    let count = raw.iter().rposition(|v| !v.is_null()).map_or(0, |i| i + 1);
+    let raw = views
+        .each_ref()
+        .map(|v| v.as_ref().map_or(core::ptr::null_mut(), Interface::as_raw));
+    let uavs = unordered
+        .each_ref()
+        .map(|v| v.as_ref().map_or(core::ptr::null_mut(), Interface::as_raw));
+    let counters = [u32::MAX; 8];
     unsafe {
         set(
             context.as_raw(),
@@ -384,6 +388,10 @@ pub(crate) fn without_targets(context: &ID3D11DeviceContext, f: impl FnOnce()) {
             depth
                 .as_ref()
                 .map_or(core::ptr::null_mut(), Interface::as_raw),
+            u32::try_from(count).unwrap(),
+            u32::try_from(8 - count).unwrap(),
+            uavs[count..].as_ptr(),
+            counters.as_ptr(),
         );
     };
 }
@@ -391,6 +399,12 @@ pub(crate) fn without_targets(context: &ID3D11DeviceContext, f: impl FnOnce()) {
 pub(crate) fn mark_copied(target: usize) {
     if let Some(w) = written(target) {
         w.store(false, Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn refresh_depth(target: usize) {
+    if written(target).is_some_and(|dirty| dirty.load(Ordering::Relaxed)) {
+        crate::copy::run(target);
     }
 }
 
@@ -522,41 +536,33 @@ unsafe extern "system" fn set_vertex_shader(
     unsafe { original(&SET_VERTEX_SHADER)(context, sent, instances, count) };
 }
 
-unsafe extern "system" fn set_pixel_resources(
-    context: *mut c_void,
-    start: u32,
-    count: u32,
-    views: *const *mut c_void,
-) {
-    immediate_only!(SET_PIXEL_RESOURCES, context, start, count, views);
-    let swapped = substituted(count, views);
-    unsafe {
-        original(&SET_PIXEL_RESOURCES)(
-            context,
-            start,
-            count,
-            swapped.as_ref().map_or(views, Vec::as_ptr),
-        );
+macro_rules! resource_hook {
+    ($name:ident, $slot:ident) => {
+        unsafe extern "system" fn $name(
+            context: *mut c_void,
+            start: u32,
+            count: u32,
+            views: *const *mut c_void,
+        ) {
+            immediate_only!($slot, context, start, count, views);
+            let swapped = substituted(count, views);
+            unsafe {
+                original(&$slot)(
+                    context,
+                    start,
+                    count,
+                    swapped.as_ref().map_or(views, Vec::as_ptr),
+                )
+            };
+        }
     };
 }
-
-unsafe extern "system" fn set_compute_resources(
-    context: *mut c_void,
-    start: u32,
-    count: u32,
-    views: *const *mut c_void,
-) {
-    immediate_only!(SET_COMPUTE_RESOURCES, context, start, count, views);
-    let swapped = substituted(count, views);
-    unsafe {
-        original(&SET_COMPUTE_RESOURCES)(
-            context,
-            start,
-            count,
-            swapped.as_ref().map_or(views, Vec::as_ptr),
-        );
-    };
-}
+resource_hook!(set_pixel_resources, SET_PIXEL_RESOURCES);
+resource_hook!(set_compute_resources, SET_COMPUTE_RESOURCES);
+resource_hook!(set_vertex_resources, SET_VERTEX_RESOURCES);
+resource_hook!(set_geometry_resources, SET_GEOMETRY_RESOURCES);
+resource_hook!(set_hull_resources, SET_HULL_RESOURCES);
+resource_hook!(set_domain_resources, SET_DOMAIN_RESOURCES);
 
 /// Shader views with a reversed depth target's own view replaced by its copy's.
 fn substituted(count: u32, views: *const *mut c_void) -> Option<Vec<*mut c_void>> {

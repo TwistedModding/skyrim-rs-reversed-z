@@ -523,6 +523,8 @@ mod tests {
         assert!(mirrored(&original, || Some(code)).is_some());
         drop(twin);
         unsafe { context.ClearState() };
+        crate::copy::tests::exercise(&device, &context);
+        unsafe { context.ClearState() };
         crate::context::release_push_scale();
         remove();
     }
