@@ -11,7 +11,7 @@ $env:SKYRIM_RS_VERSION = $version
 cargo build --release --workspace --manifest-path "$Root\Cargo.toml"
 if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
 $entries = [ordered]@{
-    "SKSE/Plugins/skyrim-rs/skyrim_rs_reversed_z.dll" = "$Root\target\release\skyrim_rs_reversed_z.dll"
+    "SKSE/Plugins/skyrim-runtime-extender/skyrim_rs_reversed_z.dll" = "$Root\target\release\skyrim_rs_reversed_z.dll"
     "README.md" = "$Root\README.md"
 }
 New-Item -ItemType Directory -Force "$Root\dist" | Out-Null
