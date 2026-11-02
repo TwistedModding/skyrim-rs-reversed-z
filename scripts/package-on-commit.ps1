@@ -1,6 +1,6 @@
 # Runs package.ps1 for the git hooks, one run at a time and again if HEAD moved during the build.
 $Root = Split-Path $PSScriptRoot -Parent
-$running = New-Object Threading.Mutex($false, "Local\skyrim-rs-package")
+$running = New-Object Threading.Mutex($false, "Local\package-$($Root -replace '[\\:]', '_')")
 try { if (-not $running.WaitOne(0)) { exit } } catch [Threading.AbandonedMutexException] {}
 New-Item -ItemType Directory -Force "$Root\dist" | Out-Null
 do {
