@@ -9,7 +9,7 @@ A Skyrim Runtime Extender plugin that draws the world view in reversed Z into 32
 
 ## Install
 
-Install the package with a mod manager, or copy its `SKSE` folder into the game's `Data` folder. You end up with `Data\SKSE\Plugins\skyrim-runtime-extender\skyrim_rs_reversed_z.dll`, which `skyrim_runtime_extender.dll` loads. The depth targets are switched to float at startup, so install it with the game closed.
+Install the package with a mod manager, or copy its `SKSE` folder into the game's `Data` folder. You end up with `Data\SKSE\Plugins\skyrim-runtime-extender\reversed_z.dll`, which `skyrim_runtime_extender.dll` loads. The depth targets are switched to float at startup, so install it with the game closed.
 
 ## Use
 
@@ -34,7 +34,7 @@ cargo build --release
 powershell -File scripts\package.ps1
 ```
 
-skyrim-rs is a submodule at `extern/skyrim-rs` (`git submodule update --init` in an existing clone). The DLL lands in `target\release\`; the package script writes `dist\skyrim-rs-reversed-z-<version>.zip` with the DLL at its install path and this README.
+skyrim-rs is a submodule at `extern/skyrim-rs` (`git submodule update --init` in an existing clone). The DLL lands in `target\release\`; the package script writes `dist\reversed-z-<version>.zip` with the DLL at its install path and this README.
 
 The package version is `<major.minor>.<commit count>`, with `-dirty` when the tree has uncommitted changes. To package every commit and merge on `master` in the background, with the output in `dist\package.log`, enable the hooks once per clone:
 

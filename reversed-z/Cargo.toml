@@ -5,7 +5,7 @@ edition.workspace = true
 publish.workspace = true
 
 [lib]
-name = "skyrim_rs_reversed_z"
+name = "reversed_z"
 crate-type = ["cdylib"]
 
 [dependencies]
