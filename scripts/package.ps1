@@ -1,9 +1,15 @@
 # Builds release and writes dist\skyrim-rs-reversed-z-<version>.zip: the DLL at its install path and the README.
+# The version is <major.minor>.<commits on HEAD>, with -dirty for a tree with uncommitted changes.
 $ErrorActionPreference = "Stop"
 $Root = Split-Path $PSScriptRoot -Parent
+$Release = "0.2"
+$commits = git -C $Root rev-list --count HEAD
+if ($LASTEXITCODE -ne 0) { throw "git rev-list failed" }
+$version = "$Release.$commits"
+if (git -C $Root status --porcelain) { $version += "-dirty" }
+$env:SKYRIM_RS_VERSION = $version
 cargo build --release --workspace --manifest-path "$Root\Cargo.toml"
 if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
-$version = ((cargo metadata --no-deps --format-version 1 --manifest-path "$Root\Cargo.toml" | ConvertFrom-Json).packages | Where-Object name -eq "reversed-z").version
 $entries = [ordered]@{
     "Data/SKSE/Plugins/skyrim-rs/skyrim_rs_reversed_z.dll" = "$Root\target\release\skyrim_rs_reversed_z.dll"
     "README.md" = "$Root\README.md"

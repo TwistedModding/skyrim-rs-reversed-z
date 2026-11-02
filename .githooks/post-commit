@@ -1,0 +1,5 @@
+#!/bin/sh
+# Packages master in the background; the output goes to dist/package.log.
+[ "$(git symbolic-ref -q --short HEAD)" = master ] || exit 0
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
+powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File scripts/package-on-commit.ps1 >/dev/null 2>&1 </dev/null &
