@@ -9,7 +9,7 @@ A skyrim-rs framework plugin that draws the world view in reversed Z into 32-bit
 
 ## Install
 
-Copy the package's `Data` folder over the game's (or install the package with a mod manager). You end up with `Data\SKSE\Plugins\skyrim-rs\skyrim_rs_reversed_z.dll`, which `skyrim_rs.dll` loads. The depth targets are switched to float at startup, so install it with the game closed.
+Install the package with a mod manager, or copy its `SKSE` folder into the game's `Data` folder. You end up with `Data\SKSE\Plugins\skyrim-rs\skyrim_rs_reversed_z.dll`, which `skyrim_rs.dll` loads. The depth targets are switched to float at startup, so install it with the game closed.
 
 ## Use
 
