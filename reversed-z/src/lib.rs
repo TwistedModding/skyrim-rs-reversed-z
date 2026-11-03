@@ -24,6 +24,7 @@ use sre::raw::fns;
 mod context;
 mod copy;
 mod shader;
+mod spirv;
 mod twin;
 mod vulkan;
 

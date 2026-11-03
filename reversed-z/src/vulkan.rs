@@ -4,8 +4,11 @@
 //! wrappers while DXVK's own keep the real pointers. A rendering whose depth attachment is a
 //! reversed world image (found through DXVK's interop interface) gets its pipelines' compare and
 //! biases mirrored (made dynamic at creation, set at each bind), its viewport ranges [a, b] made
-//! [1 - a, 1 - b] for the unchanged clip z, and its clears 1 - value. Descriptors sampling a
-//! reversed world image are pointed at its conventional copy ([`crate::copy`]) instead.
+//! and its clears 1 - value. Its vertex shaders are swapped for SPIR-V twins ([`crate::spirv`],
+//! clip z = w - z) and the viewport ranges mirrored like the context's; a pipeline whose vertex
+//! shader could not be twinned keeps its clip z and gets [a, b] flipped to [1 - a, 1 - b] instead.
+//! Descriptors sampling a reversed world image are pointed at its conventional copy
+//! ([`crate::copy`]).
 
 use core::ffi::{CStr, c_char, c_void};
 use std::collections::HashMap;
@@ -109,6 +112,14 @@ type PushSetFn = unsafe extern "system" fn(
     u32,
     *const vk::WriteDescriptorSet<'static>,
 );
+type CreateModuleFn = unsafe extern "system" fn(
+    vk::Device,
+    *const vk::ShaderModuleCreateInfo<'static>,
+    *const vk::AllocationCallbacks<'static>,
+    *mut vk::ShaderModule,
+) -> vk::Result;
+type DestroyModuleFn =
+    unsafe extern "system" fn(vk::Device, vk::ShaderModule, *const vk::AllocationCallbacks<'static>);
 type BeginBufferFn = unsafe extern "system" fn(
     vk::CommandBuffer,
     *const vk::CommandBufferBeginInfo<'static>,
@@ -146,6 +157,8 @@ static WORLD_READS: AtomicU64 = AtomicU64::new(0);
 static WORLD_TRANSFERS: AtomicU64 = AtomicU64::new(0);
 static WORLD_SET_WRITES: AtomicU64 = AtomicU64::new(0);
 static WORLD_REFRESHES: AtomicU64 = AtomicU64::new(0);
+static TWINS_MADE: AtomicU64 = AtomicU64::new(0);
+static TWINS_REFUSED: AtomicU64 = AtomicU64::new(0);
 static WORLD_DESCRIPTORS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 static NOTES: AtomicU64 = AtomicU64::new(0);
 
@@ -158,6 +171,8 @@ struct PipelineDepth {
     compare: vk::CompareOp,
     /// The static bias factors made dynamic, sent at each bind.
     bias: Option<[f32; 3]>,
+    /// The vertex shader is a twin writing w - z.
+    twinned: bool,
 }
 #[derive(Default)]
 struct Buffer {
@@ -175,6 +190,10 @@ static PIPELINES: LazyLock<Mutex<HashMap<u64, PipelineDepth>>> = LazyLock::new(M
 static BUFFERS: LazyLock<Mutex<HashMap<u64, Buffer>>> = LazyLock::new(Mutex::default);
 /// D3D textures already looked up on DXVK's device, by resource pointer.
 static TRACKED: LazyLock<Mutex<std::collections::HashSet<usize>>> = LazyLock::new(Mutex::default);
+/// The code of every vertex shader module Community Shaders made, and each one's twin.
+static MODULES: LazyLock<Mutex<HashMap<u64, Vec<u32>>>> = LazyLock::new(Mutex::default);
+static MODULE_TWINS: LazyLock<Mutex<HashMap<u64, Option<vk::ShaderModule>>>> =
+    LazyLock::new(Mutex::default);
 /// Each world image's view of its conventional copy.
 static COPIES: LazyLock<Mutex<HashMap<u64, vk::ImageView>>> = LazyLock::new(Mutex::default);
 
@@ -283,6 +302,8 @@ wrapped! {
     b"vkCmdBlitImage" => BLIT_IMAGE: BlitImageFn = blit_image,
     b"vkCmdBlitImage2" => BLIT_IMAGE_2: BlitImage2Fn = blit_image_2,
     b"vkCmdBlitImage2KHR" => BLIT_IMAGE_2_KHR: BlitImage2Fn = blit_image_2_khr,
+    b"vkCreateShaderModule" => CREATE_MODULE: CreateModuleFn = create_shader_module,
+    b"vkDestroyShaderModule" => DESTROY_MODULE: DestroyModuleFn = destroy_shader_module,
     b"vkUpdateDescriptorSets" => UPDATE_SETS: UpdateSetsFn = update_descriptor_sets,
     b"vkCmdPushDescriptorSetKHR" => PUSH_SET_KHR: PushSetFn = push_descriptor_set_khr,
     b"vkCmdPushDescriptorSet" => PUSH_SET: PushSetFn = push_descriptor_set,
@@ -521,13 +542,23 @@ fn mirrored(op: vk::CompareOp) -> vk::CompareOp {
     }
 }
 
-fn flipped(viewports: &[vk::Viewport]) -> Vec<vk::Viewport> {
+/// Mirrored (as the context's) for a twin's w - z into a reversed target; flipped when only
+/// one of the two is reversed, which with the engine's [0, 1] ranges stores the other convention.
+fn sent_viewports(viewports: &[vk::Viewport], reversed: bool, twinned: bool) -> Vec<vk::Viewport> {
     viewports
         .iter()
-        .map(|v| vk::Viewport {
-            min_depth: 1.0 - v.min_depth,
-            max_depth: 1.0 - v.max_depth,
-            ..*v
+        .map(|v| match (reversed, twinned) {
+            (true, true) => vk::Viewport {
+                min_depth: 1.0 - v.max_depth,
+                max_depth: 1.0 - v.min_depth,
+                ..*v
+            },
+            (false, false) => *v,
+            _ => vk::Viewport {
+                min_depth: 1.0 - v.min_depth,
+                max_depth: 1.0 - v.max_depth,
+                ..*v
+            },
         })
         .collect()
 }
@@ -553,6 +584,93 @@ struct DynamicStates {
     info: vk::PipelineDynamicStateCreateInfo<'static>,
 }
 
+/// The twin module of a vertex module Community Shaders made, built once.
+fn twin_module(device: vk::Device, module: vk::ShaderModule) -> Option<vk::ShaderModule> {
+    let mut twins = MODULE_TWINS.lock().unwrap();
+    if let Some(twin) = twins.get(&module.as_raw()) {
+        return *twin;
+    }
+    let made = (|| {
+        let code = MODULES.lock().unwrap().get(&module.as_raw())?.clone();
+        let twin = crate::spirv::mirrored(&code)?;
+        let n = TWINS_MADE.load(Ordering::Relaxed);
+        if n < 4 {
+            let dir = std::path::Path::new("C:/Users/jlbom/Documents/My Games/Skyrim Special Edition/SKSE/reversed-z-spirv");
+            let _ = std::fs::create_dir_all(dir);
+            let bytes = |w: &[u32]| w.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+            let _ = std::fs::write(dir.join(format!("{n}-orig.spv")), bytes(&code));
+            let _ = std::fs::write(dir.join(format!("{n}-twin.spv")), bytes(&twin));
+        }
+        create_module(device, &twin)
+    })();
+    (if made.is_some() { &TWINS_MADE } else { &TWINS_REFUSED }).fetch_add(1, Ordering::Relaxed);
+    if made.is_none() && TWINS_REFUSED.load(Ordering::Relaxed) == 1 {
+        note("a world vertex shader could not be twinned; its pipelines keep conventional clip z");
+    }
+    twins.insert(module.as_raw(), made);
+    made
+}
+
+fn create_module(device: vk::Device, code: &[u32]) -> Option<vk::ShaderModule> {
+    let create: CreateModuleFn = pointer(&CREATE_MODULE)?;
+    let info = vk::ShaderModuleCreateInfo {
+        code_size: code.len() * 4,
+        p_code: code.as_ptr(),
+        ..Default::default()
+    };
+    let mut module = vk::ShaderModule::null();
+    let result = unsafe { create(device, &raw const info, core::ptr::null(), &raw mut module) };
+    (result == vk::Result::SUCCESS && !module.is_null()).then_some(module)
+}
+
+/// The vertex stage's twin: a twin module for a module stage, rewritten code for an inline one.
+struct TwinStage {
+    stages: Vec<vk::PipelineShaderStageCreateInfo<'static>>,
+    _inline: Option<(Vec<u32>, Box<vk::ShaderModuleCreateInfo<'static>>)>,
+}
+
+fn twin_stages(device: vk::Device, info: &vk::GraphicsPipelineCreateInfo<'_>) -> Option<TwinStage> {
+    if info.p_stages.is_null() {
+        return None;
+    }
+    let given = unsafe { core::slice::from_raw_parts(info.p_stages, info.stage_count as usize) };
+    let vertex = given.iter().position(|s| s.stage == vk::ShaderStageFlags::VERTEX)?;
+    let mut stages: Vec<vk::PipelineShaderStageCreateInfo<'static>> =
+        given.iter().map(|s| unsafe { core::mem::transmute_copy(s) }).collect();
+    let stage = &mut stages[vertex];
+    if !stage.module.is_null() {
+        stage.module = twin_module(device, stage.module)?;
+        return Some(TwinStage { stages, _inline: None });
+    }
+    let mut next = stage.p_next.cast::<vk::BaseInStructure>();
+    while !next.is_null() {
+        let base = unsafe { *next };
+        if base.s_type == vk::StructureType::SHADER_MODULE_CREATE_INFO {
+            let inline = unsafe { *next.cast::<vk::ShaderModuleCreateInfo>() };
+            let code = unsafe { core::slice::from_raw_parts(inline.p_code, inline.code_size / 4) };
+            let Some(twin) = crate::spirv::mirrored(code) else {
+                TWINS_REFUSED.fetch_add(1, Ordering::Relaxed);
+                return None;
+            };
+            let patched = Box::new(vk::ShaderModuleCreateInfo {
+                p_next: inline.p_next,
+                flags: inline.flags,
+                code_size: twin.len() * 4,
+                p_code: twin.as_ptr(),
+                ..Default::default()
+            });
+            stage.p_next = (&raw const *patched).cast();
+            TWINS_MADE.fetch_add(1, Ordering::Relaxed);
+            return Some(TwinStage {
+                stages,
+                _inline: Some((twin, patched)),
+            });
+        }
+        next = base.p_next;
+    }
+    None
+}
+
 unsafe extern "system" fn create_graphics_pipelines(
     device: vk::Device,
     cache: vk::PipelineCache,
@@ -568,6 +686,7 @@ unsafe extern "system" fn create_graphics_pipelines(
     let given = unsafe { core::slice::from_raw_parts(infos, count as usize) };
     let mut patched = given.to_vec();
     let mut dynamics: Vec<Box<DynamicStates>> = Vec::new();
+    let mut twins: Vec<TwinStage> = Vec::new();
     let mut records: Vec<Option<PipelineDepth>> = Vec::with_capacity(given.len());
     for (i, info) in given.iter().enumerate() {
         records.push(None);
@@ -616,13 +735,30 @@ unsafe extern "system" fn create_graphics_pipelines(
             patched[i].p_dynamic_state = &raw const boxed.info;
             dynamics.push(boxed);
         }
+        let twinned = twin_stages(device, info).is_some_and(|twin| {
+            patched[i].p_stages = twin.stages.as_ptr();
+            twins.push(twin);
+            true
+        });
         records[i] = Some(PipelineDepth {
             compare: depth.depth_compare_op,
             bias,
+            twinned,
         });
     }
-    let result = unsafe { real(device, cache, count, patched.as_ptr(), allocator, pipelines) };
+    let mut result = unsafe { real(device, cache, count, patched.as_ptr(), allocator, pipelines) };
+    if result != vk::Result::SUCCESS && !twins.is_empty() {
+        note(&format!("twinned pipeline creation failed with {}; retrying without twins", result.as_raw()));
+        for (i, info) in given.iter().enumerate() {
+            patched[i].p_stages = info.p_stages;
+            if let Some(record) = records[i].as_mut() {
+                record.twinned = false;
+            }
+        }
+        result = unsafe { real(device, cache, count, patched.as_ptr(), allocator, pipelines) };
+    }
     drop(dynamics);
+    drop(twins);
     if result == vk::Result::SUCCESS && !pipelines.is_null() {
         let made = unsafe { core::slice::from_raw_parts(pipelines, count as usize) };
         let mut table = PIPELINES.lock().unwrap();
@@ -630,9 +766,10 @@ unsafe extern "system" fn create_graphics_pipelines(
             if let Some(record) = record {
                 if WORLD_PIPELINES.fetch_add(1, Ordering::Relaxed) == 0 {
                     note(&format!(
-                        "first world pipeline: compare {}, static bias {:?}",
+                        "first world pipeline: compare {}, static bias {:?}, twinned {}",
                         record.compare.as_raw(),
-                        record.bias
+                        record.bias,
+                        record.twinned
                     ));
                 }
                 table.insert(pipeline.as_raw(), record);
@@ -681,6 +818,7 @@ unsafe extern "system" fn bind_pipeline(
         let state = buffers.entry(buffer.as_raw()).or_default();
         state.pipeline = pipeline.as_raw();
         apply_pipeline(buffer, state);
+        send_viewports(buffer, state);
     }
 }
 
@@ -688,7 +826,12 @@ fn send_viewports(buffer: vk::CommandBuffer, state: &Buffer) {
     let Some((first, viewports, with_count)) = &state.viewports else {
         return;
     };
-    let sent = if state.reversed { flipped(viewports) } else { viewports.clone() };
+    let twinned = PIPELINES
+        .lock()
+        .unwrap()
+        .get(&state.pipeline)
+        .is_some_and(|p| p.twinned);
+    let sent = sent_viewports(viewports, state.reversed, twinned);
     let count = u32::try_from(sent.len()).unwrap();
     if *with_count {
         let real: SetViewportCountFn = pointer(&SET_VIEWPORT_COUNT)
@@ -795,7 +938,7 @@ fn begin(buffer: vk::CommandBuffer, info: *const vk::RenderingInfo<'static>, rea
     let mut buffers = BUFFERS.lock().unwrap();
     let state = buffers.entry(buffer.as_raw()).or_default();
     state.image = if reversed { image.unwrap_or(0) } else { 0 };
-    if state.reversed != reversed || reversed {
+    {
         state.reversed = reversed;
         send_viewports(buffer, state);
         send_bias(buffer, state);
@@ -1156,6 +1299,43 @@ unsafe extern "system" fn push_descriptor_set(
     unsafe { real(buffer, point, layout, set, count, writes) };
 }
 
+unsafe extern "system" fn create_shader_module(
+    device: vk::Device,
+    info: *const vk::ShaderModuleCreateInfo<'static>,
+    allocator: *const vk::AllocationCallbacks<'static>,
+    module: *mut vk::ShaderModule,
+) -> vk::Result {
+    let real: CreateModuleFn = pointer(&CREATE_MODULE).unwrap();
+    let result = unsafe { real(device, info, allocator, module) };
+    if result == vk::Result::SUCCESS
+        && let Some(info) = unsafe { info.as_ref() }
+        && !info.p_code.is_null()
+        && !module.is_null()
+    {
+        let code = unsafe { core::slice::from_raw_parts(info.p_code, info.code_size / 4) };
+        if crate::spirv::is_vertex(code) {
+            MODULES
+                .lock()
+                .unwrap()
+                .insert(unsafe { *module }.as_raw(), code.to_vec());
+        }
+    }
+    result
+}
+
+unsafe extern "system" fn destroy_shader_module(
+    device: vk::Device,
+    module: vk::ShaderModule,
+    allocator: *const vk::AllocationCallbacks<'static>,
+) {
+    MODULES.lock().unwrap().remove(&module.as_raw());
+    let real: DestroyModuleFn = pointer(&DESTROY_MODULE).unwrap();
+    if let Some(Some(twin)) = MODULE_TWINS.lock().unwrap().remove(&module.as_raw()) {
+        unsafe { real(device, twin, allocator) };
+    }
+    unsafe { real(device, module, allocator) };
+}
+
 unsafe extern "system" fn begin_command_buffer(
     buffer: vk::CommandBuffer,
     info: *const vk::CommandBufferBeginInfo<'static>,
@@ -1167,7 +1347,7 @@ unsafe extern "system" fn begin_command_buffer(
 
 pub(crate) fn counters() -> String {
     format!(
-        "vulkan: {} resolutions wrapped, world pipelines {}, world renderings {}, world views {}, world clears {}, world reads {}, world transfers {}, world set writes {}, world descriptors {:?}, world refreshes {}, tracked images {}",
+        "vulkan: {} resolutions wrapped, world pipelines {}, world renderings {}, world views {}, world clears {}, world reads {}, world transfers {}, world set writes {}, world descriptors {:?}, world refreshes {}, tracked images {}, vertex twins {} (refused {})",
         RESOLVED.load(Ordering::Relaxed),
         WORLD_PIPELINES.load(Ordering::Relaxed),
         WORLD_RENDERINGS.load(Ordering::Relaxed),
@@ -1179,5 +1359,7 @@ pub(crate) fn counters() -> String {
         WORLD_DESCRIPTORS.each_ref().map(|c| c.load(Ordering::Relaxed)),
         WORLD_REFRESHES.load(Ordering::Relaxed),
         IMAGES.lock().unwrap().len(),
+        TWINS_MADE.load(Ordering::Relaxed),
+        TWINS_REFUSED.load(Ordering::Relaxed),
     )
 }
