@@ -584,6 +584,12 @@ struct DynamicStates {
     info: vk::PipelineDynamicStateCreateInfo<'static>,
 }
 
+/// The far plane the precise endings are made for; twins are not remade when it changes.
+fn far() -> Option<f32> {
+    let far = skyrim::render::depth_shift_far();
+    (far > 0.0).then_some(far)
+}
+
 /// The twin module of a vertex module Community Shaders made, built once.
 fn twin_module(device: vk::Device, module: vk::ShaderModule) -> Option<vk::ShaderModule> {
     let mut twins = MODULE_TWINS.lock().unwrap();
@@ -592,15 +598,7 @@ fn twin_module(device: vk::Device, module: vk::ShaderModule) -> Option<vk::Shade
     }
     let made = (|| {
         let code = MODULES.lock().unwrap().get(&module.as_raw())?.clone();
-        let twin = crate::spirv::mirrored(&code)?;
-        let n = TWINS_MADE.load(Ordering::Relaxed);
-        if n < 4 {
-            let dir = std::path::Path::new("C:/Users/jlbom/Documents/My Games/Skyrim Special Edition/SKSE/reversed-z-spirv");
-            let _ = std::fs::create_dir_all(dir);
-            let bytes = |w: &[u32]| w.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
-            let _ = std::fs::write(dir.join(format!("{n}-orig.spv")), bytes(&code));
-            let _ = std::fs::write(dir.join(format!("{n}-twin.spv")), bytes(&twin));
-        }
+        let twin = crate::spirv::mirrored(&code, far())?;
         create_module(device, &twin)
     })();
     (if made.is_some() { &TWINS_MADE } else { &TWINS_REFUSED }).fetch_add(1, Ordering::Relaxed);
@@ -648,7 +646,7 @@ fn twin_stages(device: vk::Device, info: &vk::GraphicsPipelineCreateInfo<'_>) ->
         if base.s_type == vk::StructureType::SHADER_MODULE_CREATE_INFO {
             let inline = unsafe { *next.cast::<vk::ShaderModuleCreateInfo>() };
             let code = unsafe { core::slice::from_raw_parts(inline.p_code, inline.code_size / 4) };
-            let Some(twin) = crate::spirv::mirrored(code) else {
+            let Some(twin) = crate::spirv::mirrored(code, far()) else {
                 TWINS_REFUSED.fetch_add(1, Ordering::Relaxed);
                 return None;
             };

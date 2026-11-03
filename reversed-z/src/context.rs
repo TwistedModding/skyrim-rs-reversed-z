@@ -74,6 +74,8 @@ const RECORD_SHADER: usize = 0x8;
 const RECORD_SIZE: usize = 0x10;
 const RECORD_BYTECODE: usize = 0x68;
 const D3D11_CLEAR_DEPTH: u32 = 1;
+/// Each precise twin receives [near / 15, A - 1, A near, orthographic]; A - 1 as A near / far,
+/// the derivation Drawcall Limit Fix's twins share, so the two paths agree bit for bit.
 /// The near plane the engine's far push was made for.
 const VANILLA_NEAR: f32 = 15.0;
 const KEEP_TARGETS: u32 = 0xffff_ffff;
@@ -345,8 +347,11 @@ fn with_vertex_constants(context: *mut c_void, draw: impl FnOnce()) {
     // SetCurrentCameraState copies entry +0x10 to state +0; projection is entry +0x80.
     let projection = unsafe { ((state + 0x70) as *const [f32; 16]).read_unaligned() };
     let near = skyrim::render::depth_shift_near();
+    let far = skyrim::render::depth_shift_far();
     let scale = if near > 0.0 { near / VANILLA_NEAR } else { 1.0 };
-    let data = [scale, projection[10] - 1.0, -projection[14], projection[15]];
+    let a_near = -projection[14];
+    let a_less_one = if far > 0.0 { a_near / far } else { projection[10] - 1.0 };
+    let data = [scale, a_less_one, a_near, projection[15]];
     draw_with_constants(context, slot, data, draw);
 }
 
