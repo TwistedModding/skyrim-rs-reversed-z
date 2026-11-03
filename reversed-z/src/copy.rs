@@ -329,6 +329,21 @@ fn refresh(
     Ok(copy.view)
 }
 
+/// The conventional copy's texture, once a reader has asked for one.
+pub(crate) fn standard_texture(resource: &ID3D11Resource) -> Option<ID3D11Texture2D> {
+    let view: ID3D11ShaderResourceView = private_interface(resource, &VIEW)?;
+    unsafe { view.GetResource() }.ok()?.cast().ok()
+}
+
+/// Makes the copy of a world target that has none yet, for readers past the context.
+pub(crate) fn ensure(context: &ID3D11DeviceContext, resource: &ID3D11Resource) {
+    if private_interface::<ID3D11ShaderResourceView>(resource, &VIEW).is_none()
+        && let Err(error) = refresh(context, resource, None)
+    {
+        report(&error);
+    }
+}
+
 pub(crate) fn report(message: &str) {
     if UNSUPPORTED.fetch_add(1, Ordering::Relaxed) == 0 {
         crate::log(&format!("depth compatibility gap: {message}"));
@@ -442,8 +457,13 @@ pub(crate) fn copied_region(
             .iter()
             .any(|seed| seed.load(Ordering::Relaxed) == destination.as_raw() as usize)
     {
-        mark(destination, reversed(source));
+        let inverted = reversed(source);
+        mark(destination, inverted);
         COPIED.fetch_add(1, Ordering::Relaxed);
+        if inverted {
+            ensure(context, destination);
+            crate::vulkan::track(destination);
+        }
         run(context, destination);
     }
 }
