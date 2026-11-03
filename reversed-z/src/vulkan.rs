@@ -76,42 +76,6 @@ type GetDescriptorFn = unsafe extern "system" fn(
     usize,
     *mut c_void,
 );
-type CopyImageFn = unsafe extern "system" fn(
-    vk::CommandBuffer,
-    vk::Image,
-    vk::ImageLayout,
-    vk::Image,
-    vk::ImageLayout,
-    u32,
-    *const vk::ImageCopy,
-);
-type CopyImage2Fn = unsafe extern "system" fn(vk::CommandBuffer, *const vk::CopyImageInfo2<'static>);
-type BlitImageFn = unsafe extern "system" fn(
-    vk::CommandBuffer,
-    vk::Image,
-    vk::ImageLayout,
-    vk::Image,
-    vk::ImageLayout,
-    u32,
-    *const vk::ImageBlit,
-    vk::Filter,
-);
-type BlitImage2Fn = unsafe extern "system" fn(vk::CommandBuffer, *const vk::BlitImageInfo2<'static>);
-type UpdateSetsFn = unsafe extern "system" fn(
-    vk::Device,
-    u32,
-    *const vk::WriteDescriptorSet<'static>,
-    u32,
-    *const vk::CopyDescriptorSet<'static>,
-);
-type PushSetFn = unsafe extern "system" fn(
-    vk::CommandBuffer,
-    vk::PipelineBindPoint,
-    vk::PipelineLayout,
-    u32,
-    u32,
-    *const vk::WriteDescriptorSet<'static>,
-);
 type CreateModuleFn = unsafe extern "system" fn(
     vk::Device,
     *const vk::ShaderModuleCreateInfo<'static>,
@@ -154,12 +118,8 @@ static WORLD_RENDERINGS: AtomicU64 = AtomicU64::new(0);
 static WORLD_VIEWS: AtomicU64 = AtomicU64::new(0);
 static WORLD_CLEARS: AtomicU64 = AtomicU64::new(0);
 static WORLD_READS: AtomicU64 = AtomicU64::new(0);
-static WORLD_TRANSFERS: AtomicU64 = AtomicU64::new(0);
-static WORLD_SET_WRITES: AtomicU64 = AtomicU64::new(0);
-static WORLD_REFRESHES: AtomicU64 = AtomicU64::new(0);
 static TWINS_MADE: AtomicU64 = AtomicU64::new(0);
 static TWINS_REFUSED: AtomicU64 = AtomicU64::new(0);
-static WORLD_DESCRIPTORS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 static NOTES: AtomicU64 = AtomicU64::new(0);
 
 struct World {
@@ -178,6 +138,7 @@ struct PipelineDepth {
 struct Buffer {
     reversed: bool,
     image: u64,
+    layout: vk::ImageLayout,
     viewports: Option<(u32, Vec<vk::Viewport>, bool)>,
     bias: Option<[f32; 3]>,
     compare: Option<vk::CompareOp>,
@@ -195,7 +156,16 @@ static MODULES: LazyLock<Mutex<HashMap<u64, Vec<u32>>>> = LazyLock::new(Mutex::d
 static MODULE_TWINS: LazyLock<Mutex<HashMap<u64, Option<vk::ShaderModule>>>> =
     LazyLock::new(Mutex::default);
 /// Each world image's view of its conventional copy.
-static COPIES: LazyLock<Mutex<HashMap<u64, vk::ImageView>>> = LazyLock::new(Mutex::default);
+static COPIES: LazyLock<Mutex<HashMap<u64, StandardCopy>>> = LazyLock::new(Mutex::default);
+
+/// A world image's conventional copy on DXVK's device.
+#[derive(Clone, Copy)]
+struct StandardCopy {
+    view: vk::ImageView,
+    image: vk::Image,
+    width: u32,
+    height: u32,
+}
 
 fn note(message: &str) {
     if NOTES.fetch_add(1, Ordering::Relaxed) < 24 {
@@ -296,17 +266,8 @@ wrapped! {
     b"vkDestroyImageView" => DESTROY_VIEW: DestroyViewFn = destroy_image_view,
     b"vkBeginCommandBuffer" => BEGIN_BUFFER: BeginBufferFn = begin_command_buffer,
     b"vkGetDescriptorEXT" => GET_DESCRIPTOR: GetDescriptorFn = get_descriptor,
-    b"vkCmdCopyImage" => COPY_IMAGE: CopyImageFn = copy_image,
-    b"vkCmdCopyImage2" => COPY_IMAGE_2: CopyImage2Fn = copy_image_2,
-    b"vkCmdCopyImage2KHR" => COPY_IMAGE_2_KHR: CopyImage2Fn = copy_image_2_khr,
-    b"vkCmdBlitImage" => BLIT_IMAGE: BlitImageFn = blit_image,
-    b"vkCmdBlitImage2" => BLIT_IMAGE_2: BlitImage2Fn = blit_image_2,
-    b"vkCmdBlitImage2KHR" => BLIT_IMAGE_2_KHR: BlitImage2Fn = blit_image_2_khr,
     b"vkCreateShaderModule" => CREATE_MODULE: CreateModuleFn = create_shader_module,
     b"vkDestroyShaderModule" => DESTROY_MODULE: DestroyModuleFn = destroy_shader_module,
-    b"vkUpdateDescriptorSets" => UPDATE_SETS: UpdateSetsFn = update_descriptor_sets,
-    b"vkCmdPushDescriptorSetKHR" => PUSH_SET_KHR: PushSetFn = push_descriptor_set_khr,
-    b"vkCmdPushDescriptorSet" => PUSH_SET: PushSetFn = push_descriptor_set,
 }
 
 macro_rules! gpa_detour {
@@ -447,6 +408,7 @@ pub(crate) fn engage() -> Result<String, String> {
     if SET_COMPARE.load(Ordering::Relaxed) == 0 {
         return Err("the device has no dynamic depth compare".into());
     }
+    crate::stream::setup(device, gpa)?;
     sync_images();
     let images = IMAGES.lock().unwrap();
     let formats: Vec<i32> = images.values().map(|w| w.format.as_raw()).collect();
@@ -936,6 +898,7 @@ fn begin(buffer: vk::CommandBuffer, info: *const vk::RenderingInfo<'static>, rea
     let mut buffers = BUFFERS.lock().unwrap();
     let state = buffers.entry(buffer.as_raw()).or_default();
     state.image = if reversed { image.unwrap_or(0) } else { 0 };
+    state.layout = attachment.map_or(vk::ImageLayout::UNDEFINED, |a| a.image_layout);
     {
         state.reversed = reversed;
         send_viewports(buffer, state);
@@ -953,23 +916,33 @@ unsafe extern "system" fn begin_rendering_khr(buffer: vk::CommandBuffer, info: *
     begin(buffer, info, pointer(&BEGIN_RENDERING_KHR).unwrap());
 }
 
-/// After a rendering into a world image, its copy is refreshed in the same command stream.
+/// After a rendering into a world image, its copy is refreshed in the same command stream
+/// ([`crate::stream`]), before the buffer's next read of it.
 fn ended(buffer: vk::CommandBuffer) {
-    let image = BUFFERS
+    let (image, layout) = BUFFERS
         .lock()
         .unwrap()
         .get(&buffer.as_raw())
-        .map_or(0, |s| s.image);
+        .map_or((0, vk::ImageLayout::UNDEFINED), |s| (s.image, s.layout));
     if image == 0 {
         return;
     }
-    let resource = IMAGES.lock().unwrap().get(&image).map(|w| w.resource as *mut c_void);
-    if let Some(resource) = resource
-        && let Some(resource) = unsafe { ID3D11Resource::from_raw_borrowed(&resource) }
-    {
-        crate::context::refresh_copy(resource);
-        WORLD_REFRESHES.fetch_add(1, Ordering::Relaxed);
+    let world = vk::Image::from_raw(image);
+    if !crate::stream::is_prepared(world) {
+        let device = vk::Device::from_raw(DEVICE.load(Ordering::Relaxed) as u64);
+        let format = IMAGES.lock().unwrap().get(&image).map(|w| w.format);
+        if copy_view(device, image).is_none() {
+            return;
+        }
+        let copy = COPIES.lock().unwrap().get(&image).copied();
+        if let (Some(format), Some(copy)) = (format, copy)
+            && let Err(e) = crate::stream::prepare(world, format, copy.image, copy.view, copy.width, copy.height)
+        {
+            note(&format!("in-stream copy unavailable: {e}"));
+            return;
+        }
     }
+    crate::stream::record(buffer, world, layout);
 }
 
 unsafe extern "system" fn end_rendering(buffer: vk::CommandBuffer) {
@@ -1048,13 +1021,11 @@ unsafe extern "system" fn create_image_view(
                 .lock()
                 .unwrap()
                 .insert(unsafe { *view }.as_raw(), info.image.as_raw());
-            if WORLD_VIEWS.fetch_add(1, Ordering::Relaxed) < 6 {
-                let target = IMAGES.lock().unwrap().get(&info.image.as_raw()).map(|w| w.target);
+            if WORLD_VIEWS.fetch_add(1, Ordering::Relaxed) == 0 {
                 note(&format!(
-                    "view on world target {target:?}: format {}, aspect {:#x}, type {}",
+                    "first view on a world image: format {}, aspect {:#x}",
                     info.format.as_raw(),
-                    info.subresource_range.aspect_mask.as_raw(),
-                    info.view_type.as_raw()
+                    info.subresource_range.aspect_mask.as_raw()
                 ));
             }
         }
@@ -1075,8 +1046,8 @@ unsafe extern "system" fn destroy_image_view(
 /// A view of the world image's conventional copy, made on first use.
 fn copy_view(device: vk::Device, world: u64) -> Option<vk::ImageView> {
     let mut copies = COPIES.lock().unwrap();
-    if let Some(view) = copies.get(&world) {
-        return Some(*view);
+    if let Some(copy) = copies.get(&world) {
+        return Some(copy.view);
     }
     let resource = IMAGES.lock().unwrap().get(&world)?.resource as *mut c_void;
     let resource = unsafe { ID3D11Resource::from_raw_borrowed(&resource) }?;
@@ -1108,7 +1079,15 @@ fn copy_view(device: vk::Device, world: u64) -> Option<vk::ImageView> {
             layout.as_raw()
         ));
     }
-    copies.insert(world, view);
+    copies.insert(
+        world,
+        StandardCopy {
+            view,
+            image,
+            width: info.extent.width,
+            height: info.extent.height,
+        },
+    );
     Some(view)
 }
 
@@ -1120,29 +1099,17 @@ unsafe extern "system" fn get_descriptor(
 ) {
     let real: GetDescriptorFn = pointer(&GET_DESCRIPTOR).unwrap();
     let given = (!info.is_null()).then(|| unsafe { *info });
-    let kind = given.and_then(|g| match g.ty {
-        vk::DescriptorType::SAMPLED_IMAGE => Some(0),
-        vk::DescriptorType::COMBINED_IMAGE_SAMPLER => Some(1),
-        vk::DescriptorType::STORAGE_IMAGE => Some(2),
-        vk::DescriptorType::INPUT_ATTACHMENT => Some(3),
-        _ => None,
-    });
     let image = given
-        .zip(kind)
-        .map(|(g, _)| unsafe { g.data.p_sampled_image })
+        .filter(|g| {
+            matches!(
+                g.ty,
+                vk::DescriptorType::SAMPLED_IMAGE | vk::DescriptorType::COMBINED_IMAGE_SAMPLER
+            )
+        })
+        .map(|g| unsafe { g.data.p_sampled_image })
         .filter(|p| !p.is_null())
         .map(|p| unsafe { *p });
     let world = image.and_then(|i| VIEWS.lock().unwrap().get(&i.image_view.as_raw()).copied());
-    if let (Some(kind), Some(world)) = (kind, world) {
-        if WORLD_DESCRIPTORS[kind].fetch_add(1, Ordering::Relaxed) == 0 {
-            let target = IMAGES.lock().unwrap().get(&world).map(|w| w.target);
-            note(&format!("first descriptor of kind {kind} on world target {target:?}"));
-        }
-        if kind > 1 {
-            unsafe { real(device, info, size, out) };
-            return;
-        }
-    }
     let Some((image, world)) = image.zip(world).filter(|&(_, w)| reversed(vk::Image::from_raw(w)))
     else {
         unsafe { real(device, info, size, out) };
@@ -1163,138 +1130,6 @@ unsafe extern "system" fn get_descriptor(
     };
     WORLD_READS.fetch_add(1, Ordering::Relaxed);
     unsafe { real(device, &raw const patched, size, out) };
-}
-
-/// Counts transfers that read or write a world image; those read it as written.
-fn transferred(what: &str, source: vk::Image, destination: vk::Image) {
-    let images = IMAGES.lock().unwrap();
-    let from = images.contains_key(&source.as_raw());
-    let to = images.contains_key(&destination.as_raw());
-    drop(images);
-    if (from || to) && WORLD_TRANSFERS.fetch_add(1, Ordering::Relaxed) == 0 {
-        note(&format!("first {what} of a world image: from world {from}, to world {to}"));
-    }
-}
-
-unsafe extern "system" fn copy_image(
-    buffer: vk::CommandBuffer,
-    source: vk::Image,
-    source_layout: vk::ImageLayout,
-    destination: vk::Image,
-    destination_layout: vk::ImageLayout,
-    count: u32,
-    regions: *const vk::ImageCopy,
-) {
-    transferred("copy", source, destination);
-    let real: CopyImageFn = pointer(&COPY_IMAGE).unwrap();
-    unsafe { real(buffer, source, source_layout, destination, destination_layout, count, regions) };
-}
-
-unsafe extern "system" fn copy_image_2(buffer: vk::CommandBuffer, info: *const vk::CopyImageInfo2<'static>) {
-    if let Some(info) = unsafe { info.as_ref() } {
-        transferred("copy", info.src_image, info.dst_image);
-    }
-    let real: CopyImage2Fn = pointer(&COPY_IMAGE_2).unwrap();
-    unsafe { real(buffer, info) };
-}
-
-unsafe extern "system" fn copy_image_2_khr(buffer: vk::CommandBuffer, info: *const vk::CopyImageInfo2<'static>) {
-    if let Some(info) = unsafe { info.as_ref() } {
-        transferred("copy", info.src_image, info.dst_image);
-    }
-    let real: CopyImage2Fn = pointer(&COPY_IMAGE_2_KHR).unwrap();
-    unsafe { real(buffer, info) };
-}
-
-#[allow(clippy::too_many_arguments)]
-unsafe extern "system" fn blit_image(
-    buffer: vk::CommandBuffer,
-    source: vk::Image,
-    source_layout: vk::ImageLayout,
-    destination: vk::Image,
-    destination_layout: vk::ImageLayout,
-    count: u32,
-    regions: *const vk::ImageBlit,
-    filter: vk::Filter,
-) {
-    transferred("blit", source, destination);
-    let real: BlitImageFn = pointer(&BLIT_IMAGE).unwrap();
-    unsafe { real(buffer, source, source_layout, destination, destination_layout, count, regions, filter) };
-}
-
-unsafe extern "system" fn blit_image_2(buffer: vk::CommandBuffer, info: *const vk::BlitImageInfo2<'static>) {
-    if let Some(info) = unsafe { info.as_ref() } {
-        transferred("blit", info.src_image, info.dst_image);
-    }
-    let real: BlitImage2Fn = pointer(&BLIT_IMAGE_2).unwrap();
-    unsafe { real(buffer, info) };
-}
-
-unsafe extern "system" fn blit_image_2_khr(buffer: vk::CommandBuffer, info: *const vk::BlitImageInfo2<'static>) {
-    if let Some(info) = unsafe { info.as_ref() } {
-        transferred("blit", info.src_image, info.dst_image);
-    }
-    let real: BlitImage2Fn = pointer(&BLIT_IMAGE_2_KHR).unwrap();
-    unsafe { real(buffer, info) };
-}
-
-/// Counts descriptor-set writes whose image views are on world images.
-fn set_writes(what: &str, count: u32, writes: *const vk::WriteDescriptorSet<'static>) {
-    if writes.is_null() {
-        return;
-    }
-    let views = VIEWS.lock().unwrap();
-    for write in unsafe { core::slice::from_raw_parts(writes, count as usize) } {
-        if write.p_image_info.is_null() {
-            continue;
-        }
-        let infos = unsafe { core::slice::from_raw_parts(write.p_image_info, write.descriptor_count as usize) };
-        for info in infos {
-            if views.contains_key(&info.image_view.as_raw())
-                && WORLD_SET_WRITES.fetch_add(1, Ordering::Relaxed) == 0
-            {
-                note(&format!("first {what} on a world image: type {}", write.descriptor_type.as_raw()));
-            }
-        }
-    }
-}
-
-unsafe extern "system" fn update_descriptor_sets(
-    device: vk::Device,
-    write_count: u32,
-    writes: *const vk::WriteDescriptorSet<'static>,
-    copy_count: u32,
-    copies: *const vk::CopyDescriptorSet<'static>,
-) {
-    set_writes("set write", write_count, writes);
-    let real: UpdateSetsFn = pointer(&UPDATE_SETS).unwrap();
-    unsafe { real(device, write_count, writes, copy_count, copies) };
-}
-
-unsafe extern "system" fn push_descriptor_set_khr(
-    buffer: vk::CommandBuffer,
-    point: vk::PipelineBindPoint,
-    layout: vk::PipelineLayout,
-    set: u32,
-    count: u32,
-    writes: *const vk::WriteDescriptorSet<'static>,
-) {
-    set_writes("push write", count, writes);
-    let real: PushSetFn = pointer(&PUSH_SET_KHR).unwrap();
-    unsafe { real(buffer, point, layout, set, count, writes) };
-}
-
-unsafe extern "system" fn push_descriptor_set(
-    buffer: vk::CommandBuffer,
-    point: vk::PipelineBindPoint,
-    layout: vk::PipelineLayout,
-    set: u32,
-    count: u32,
-    writes: *const vk::WriteDescriptorSet<'static>,
-) {
-    set_writes("push write", count, writes);
-    let real: PushSetFn = pointer(&PUSH_SET).unwrap();
-    unsafe { real(buffer, point, layout, set, count, writes) };
 }
 
 unsafe extern "system" fn create_shader_module(
@@ -1345,17 +1180,14 @@ unsafe extern "system" fn begin_command_buffer(
 
 pub(crate) fn counters() -> String {
     format!(
-        "vulkan: {} resolutions wrapped, world pipelines {}, world renderings {}, world views {}, world clears {}, world reads {}, world transfers {}, world set writes {}, world descriptors {:?}, world refreshes {}, tracked images {}, vertex twins {} (refused {})",
+        "vulkan: {} resolutions wrapped, world pipelines {}, world renderings {}, world views {}, world clears {}, world reads {}, in-stream copies {}, tracked images {}, vertex twins {} (refused {})",
         RESOLVED.load(Ordering::Relaxed),
         WORLD_PIPELINES.load(Ordering::Relaxed),
         WORLD_RENDERINGS.load(Ordering::Relaxed),
         WORLD_VIEWS.load(Ordering::Relaxed),
         WORLD_CLEARS.load(Ordering::Relaxed),
         WORLD_READS.load(Ordering::Relaxed),
-        WORLD_TRANSFERS.load(Ordering::Relaxed),
-        WORLD_SET_WRITES.load(Ordering::Relaxed),
-        WORLD_DESCRIPTORS.each_ref().map(|c| c.load(Ordering::Relaxed)),
-        WORLD_REFRESHES.load(Ordering::Relaxed),
+        crate::stream::recorded(),
         IMAGES.lock().unwrap().len(),
         TWINS_MADE.load(Ordering::Relaxed),
         TWINS_REFUSED.load(Ordering::Relaxed),

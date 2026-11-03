@@ -140,7 +140,6 @@ hooks! {
 }
 
 static IMMEDIATE: AtomicUsize = AtomicUsize::new(0);
-static RENDER_THREAD: Mutex<Option<std::thread::ThreadId>> = Mutex::new(None);
 /// A world depth view is bound and the calls sent to the context are mirrored.
 static BOUND: AtomicBool = AtomicBool::new(false);
 static LAST_DEPTH_STATE: AtomicUsize = AtomicUsize::new(0);
@@ -474,24 +473,8 @@ unsafe extern "system" fn set_targets(
     depth: *mut c_void,
 ) {
     immediate_only!(SET_TARGETS, context, count, views, depth);
-    RENDER_THREAD
-        .lock()
-        .unwrap()
-        .get_or_insert_with(|| std::thread::current().id());
     unsafe { original(&SET_TARGETS)(context, count, views, depth) };
     bind(context, depth);
-}
-
-/// Refreshes a world target's copy from the render thread, for readers past the context.
-pub(crate) fn refresh_copy(resource: &ID3D11Resource) {
-    if *RENDER_THREAD.lock().unwrap() != Some(std::thread::current().id()) {
-        return;
-    }
-    let context = IMMEDIATE.load(Ordering::Relaxed) as *mut c_void;
-    if let Some(context) = unsafe { ID3D11DeviceContext::from_raw_borrowed(&context) } {
-        crate::copy::mark(resource, BOUND.load(Ordering::Relaxed) || crate::copy::reversed(resource));
-        crate::copy::run(context, resource);
-    }
 }
 
 unsafe extern "system" fn set_targets_uav(

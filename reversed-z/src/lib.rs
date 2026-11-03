@@ -25,6 +25,7 @@ mod context;
 mod copy;
 mod shader;
 mod spirv;
+mod stream;
 mod twin;
 mod vulkan;
 
