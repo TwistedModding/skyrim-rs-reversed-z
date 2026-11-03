@@ -92,8 +92,12 @@ fn install_hook<F: Copy>(
     Ok(())
 }
 
+/// Hooks device creation on DXVK's D3D11 when Community Shaders loaded it, else the system's.
 pub(crate) fn install() -> Result<(), String> {
-    let module = unsafe { GetModuleHandleW(w!("d3d11.dll")) }.map_err(|e| e.to_string())?;
+    let module = [w!("dxvk_d3d11.dll"), w!("d3d11.dll")]
+        .into_iter()
+        .find_map(|name| unsafe { GetModuleHandleW(name) }.ok())
+        .ok_or("no D3D11 module")?;
     let device =
         unsafe { GetProcAddress(module, s!("D3D11CreateDevice")) }.ok_or("no D3D11CreateDevice")?;
     let swap_chain = unsafe { GetProcAddress(module, s!("D3D11CreateDeviceAndSwapChain")) }
