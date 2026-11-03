@@ -24,6 +24,8 @@ Experimental support for stock Community Shaders 1.9.1 requires no CS patches. D
 
 With RS Improved Camera and CS, use the Skyrim Runtime Extender loader with API 5 or newer (reported in `skyrim-runtime-extender.log`). Hook chaining is the default and preserves IC body-part hiding without an INI change. An explicit `compat = refuse` setting disables chaining globally. Earlier loaders require `compat = stack` in `Data\SKSE\Plugins\skyrim-runtime-extender.ini`.
 
+With the Community Shaders test build that runs the game on DXVK and draws the world through Drawcall Limit Fix, the plugin also mirrors DCLF's own Vulkan renderings into the world depth targets (`reversed-z.log` says `vulkan: 3 world images on DXVK's device`). DCLF's occlusion culling and its far-depth precision are not yet covered; the console line reports the Vulkan counters.
+
 `ReversedZ off` keeps the D32 depth targets created at startup. With Community Shaders, a translucent riverbank band can appear in this mode; the original DLL also reproduces it. For a stock depth-format comparison, disable this mod and restart the game.
 
 ## Build and package
