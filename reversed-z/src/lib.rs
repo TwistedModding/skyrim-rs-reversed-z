@@ -25,6 +25,7 @@ mod context;
 mod copy;
 mod shader;
 mod twin;
+mod vulkan;
 
 framework::plugin! {
     name: "reversed-z",
@@ -78,6 +79,9 @@ fn load(host: &'static Host) -> bool {
     if let Err(e) = shader::install() {
         log(&format!("replacement shader capture unavailable: {e}"));
     }
+    if let Err(e) = vulkan::install() {
+        log(&format!("vulkan resolution hooks unavailable: {e}"));
+    }
     for (offset, old, new) in FORMAT_PATCHES {
         if let Err(e) = unsafe {
             host.hooks().patch(
@@ -116,6 +120,10 @@ fn engage() {
                 "ready: world depth targets are D32 float, {}",
                 if active() { "on" } else { "off" }
             ));
+            match vulkan::engage() {
+                Ok(found) => log(&format!("vulkan: {found}")),
+                Err(e) => log(&format!("vulkan: off, {e}")),
+            }
         }
         Err(e) => log(&format!("not engaged: {e}")),
     }
@@ -124,6 +132,7 @@ fn engage() {
 fn unload() {
     READY.store(false, Ordering::Release);
     context::remove();
+    vulkan::remove();
     context::release_push_scale();
     copy::release();
     shader::remove();
@@ -154,11 +163,12 @@ impl Command for ReversedZ {
             _ => {}
         }
         skyrim::input::print(&format!(
-            "reversed-z: {} (ready {}, wanted {}), {}",
+            "reversed-z: {} (ready {}, wanted {}), {}, {}",
             if active() { "on" } else { "off" },
             READY.load(Ordering::Acquire),
             WANTED.load(Ordering::Relaxed),
             context::counters(),
+            vulkan::counters(),
         ));
         true
     }

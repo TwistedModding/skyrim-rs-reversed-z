@@ -15,6 +15,7 @@ skyrim = { path = "extern/skyrim-rs/crates/skyrim", version = "0.1.0" }
 framework = { path = "extern/skyrim-rs/crates/framework", version = "0.1.0" }
 hook = { path = "extern/skyrim-rs/crates/hook", version = "0.1.0" }
 windows = "0.62"
+ash = { version = "0.38", default-features = false }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
