@@ -33,7 +33,10 @@ const DCL_INPUT_PS_SGV: u32 = 99;
 const DCL_INPUT_PS_SIV: u32 = 100;
 const DCL_OUTPUT: u32 = 101;
 const DCL_TEMPS: u32 = 104;
-const DECLARATIONS: core::ops::RangeInclusive<u32> = 0x58..=0x6b;
+/// Declaration opcodes: shader model 4's, shader model 5's and the geometry instance count.
+fn declaration(op: u32) -> bool {
+    matches!(op, 0x58..=0x6b | 0x8f..=0xa2 | 0xce | CUSTOM_DATA)
+}
 const NAME_POSITION: u32 = 1;
 
 const TEMP: u32 = 0;
@@ -167,7 +170,7 @@ fn decode(tok: &[u32]) -> Option<Vec<Instruction>> {
             return None;
         }
         let mut operands = Vec::new();
-        if !DECLARATIONS.contains(&op) && op != CUSTOM_DATA {
+        if !declaration(op) {
             let mut j = i + 1;
             if tok[i] & EXTENDED != 0 {
                 while tok[j] & EXTENDED != 0 {
@@ -522,7 +525,7 @@ pub(crate) fn mirrored(container: &[u8]) -> Option<Mirrored> {
     let position = position?;
     let first = code
         .iter()
-        .position(|i| !DECLARATIONS.contains(&i.op) && i.op != CUSTOM_DATA)?;
+        .position(|i| !declaration(i.op))?;
     let base = temps.unwrap_or(0);
 
     let position_out = |mask: u8| reg(OUTPUT, position, Some(mask), XYZW, false);
@@ -730,7 +733,7 @@ pub(crate) fn pixel(container: &[u8]) -> Option<Pixel> {
     });
     let first = code
         .iter()
-        .position(|ins| !DECLARATIONS.contains(&ins.op) && ins.op != CUSTOM_DATA)?;
+        .position(|ins| !declaration(ins.op))?;
     let mut out = tok[..2].to_vec();
     for (n, ins) in code.iter().enumerate() {
         let mut body = tok[ins.at..ins.at + ins.len].to_vec();
@@ -764,7 +767,9 @@ pub(crate) fn pixel(container: &[u8]) -> Option<Pixel> {
                 );
             }
         }
-        body[0] = (body[0] & !(0x7f << 24)) | ((body.len() as u32) << 24);
+        if ins.op != CUSTOM_DATA {
+            body[0] = (body[0] & !(0x7f << 24)) | ((body.len() as u32) << 24);
+        }
         if matches!(ins.op, RET | RETC) {
             out.extend(&tail);
         }
@@ -920,6 +925,47 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn pixel_prologue_follows_shader_model_5_declarations() {
+        let code = compile_stage(
+            "StructuredBuffer<float4> lights : register(t35);
+             float4 main(float4 p : SV_Position) : SV_Target { return lights[(uint)p.x] * p.z; }",
+            s!("ps_5_0"),
+        );
+        let super::Pixel::Mirrored(twin) = super::pixel(&code).unwrap() else {
+            panic!("position z is read")
+        };
+        let text = text(&twin.code);
+        let lines: Vec<&str> = text.lines().filter(|l| !l.starts_with("//")).collect();
+        let last_declaration = lines.iter().rposition(|l| l.starts_with("dcl_")).unwrap();
+        let prologue = lines.iter().position(|l| l.starts_with("mov r")).unwrap();
+        assert!(lines.iter().any(|l| l.starts_with("dcl_resource_structured")), "{lines:?}");
+        assert!(prologue > last_declaration, "{lines:?}");
+    }
+
+    #[test]
+    fn pixel_twin_keeps_the_immediate_constant_buffer() {
+        let code = compile_stage(
+            "static const float4 table[4] = { float4(1, 2, 3, 4), float4(5, 6, 7, 8), float4(9, 1, 2, 3), float4(4, 5, 6, 7) };
+             float4 main(float4 p : SV_Position) : SV_Target { return table[(uint)p.x % 4] * p.z; }",
+            s!("ps_5_0"),
+        );
+        let super::Pixel::Mirrored(twin) = super::pixel(&code).unwrap() else {
+            panic!("position z is read")
+        };
+        let custom = |container: &[u8]| {
+            let (_, _, tok) = super::program(container).unwrap();
+            super::decode(&tok)
+                .unwrap()
+                .into_iter()
+                .find(|ins| ins.op == super::CUSTOM_DATA)
+                .map(|ins| (tok[ins.at], tok[ins.at + 1]))
+                .unwrap()
+        };
+        assert_eq!(custom(&twin.code), custom(&code));
+        assert_eq!(super::checksum(&twin.code), twin.code[4..20]);
+    }
+
+    #[test]
     fn checksum_matches_the_compiler() {
         let code = compile(ROWS);
         assert_eq!(super::checksum(&code), code[4..20]);
@@ -1015,3 +1061,4 @@ pub(crate) mod tests {
         }
     }
 }
+
