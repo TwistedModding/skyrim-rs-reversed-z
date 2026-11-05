@@ -2,7 +2,7 @@
 # The version is <major.minor>.<commits on HEAD>, with -dirty for a tree with uncommitted changes.
 $ErrorActionPreference = "Stop"
 $Root = Split-Path $PSScriptRoot -Parent
-$Release = "0.2"
+$Release = "0.3"
 $commits = git -C $Root rev-list --count HEAD
 if ($LASTEXITCODE -ne 0) { throw "git rev-list failed" }
 $version = "$Release.$commits"
