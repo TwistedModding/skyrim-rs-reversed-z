@@ -1,0 +1,31 @@
+# Uploads each published GitHub release's package to the mod's file on Nexus Mods.
+name: Nexus Mods
+on:
+  release:
+    types: [published]
+jobs:
+  upload:
+    if: vars.NEXUS_FILE_ID != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - id: package
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          version="${TAG#v}"
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "reversed-z-$version.zip"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - uses: Nexus-Mods/upload-action@98532f7670c27cbecc78fae03fa3e278147827e2 # v1.0.0-beta.11
+        with:
+          api_key: ${{ secrets.NEXUSMODS_API_KEY }}
+          mod_id: ${{ vars.NEXUS_MOD_ID }}
+          file_id: ${{ vars.NEXUS_FILE_ID }}
+          filename: reversed-z-${{ steps.package.outputs.version }}.zip
+          display_name: Reversed Z
+          version: ${{ steps.package.outputs.version }}
+          changelog: ${{ github.event.release.body }}
+          archive_existing_version: true
+          update_mod_version: true
