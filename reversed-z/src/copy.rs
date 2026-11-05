@@ -601,6 +601,11 @@ fn convert(context: &ID3D11DeviceContext, shader: &ID3D11ComputeShader, c: &Copy
                 Some(instances.as_mut_ptr()),
                 Some(&raw mut instance_count),
             );
+            // ENB leaves pointers it does not hand over in the slots past the returned count.
+            let instance_count = instance_count.min(D3D11_SHADER_MAX_INTERFACES) as usize;
+            instances[instance_count..]
+                .iter_mut()
+                .for_each(|slot| core::mem::forget(slot.take()));
             let mut outputs: [Option<ID3D11UnorderedAccessView>; 1] = Default::default();
             context.CSGetUnorderedAccessViews(0, Some(&mut outputs));
 
@@ -613,7 +618,7 @@ fn convert(context: &ID3D11DeviceContext, shader: &ID3D11ComputeShader, c: &Copy
             context.CSSetUnorderedAccessViews(0, 1, Some(outputs.as_ptr()), None);
             context.CSSetShader(
                 previous_shader.as_ref(),
-                Some(&instances[..instance_count as usize]),
+                Some(&instances[..instance_count]),
             );
         });
     });
