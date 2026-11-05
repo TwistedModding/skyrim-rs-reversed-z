@@ -44,15 +44,18 @@ static READY: AtomicBool = AtomicBool::new(false);
 /// `Renderer::CreateDepthStencilObjects` takes a stencil target's formats from one immediate
 /// (`D24_UNORM_S8_UINT`) and register offsets of it, and the 16-bit targets' from the same register:
 /// these bytes give `D32_FLOAT_S8X24_UINT` with its typeless, depth and stencil views and keep the
-/// 16-bit formats. Offsets from the function's entry, original byte, new byte.
-const FORMAT_PATCHES: [(usize, u8, u8); 6] = [
-    (0x32, 0x2d, 0x14),
-    (0x42, 0x08, 0x21),
-    (0x45, 0x0a, 0x23),
-    (0x48, 0x0b, 0x24),
-    (0x75, 0x2e, 0x15),
-    (0x1fa, 0x2f, 0x16),
-];
+/// 16-bit formats. The site, original byte, new byte.
+fn format_patches() -> [(Location, u8, u8); 6] {
+    use fns::Renderer__CreateDepthStencilObjects as CREATE;
+    [
+        (framework::location!(CREATE, 0x32), 0x2d, 0x14),
+        (framework::location!(CREATE, 0x42), 0x08, 0x21),
+        (framework::location!(CREATE, 0x45), 0x0a, 0x23),
+        (framework::location!(CREATE, 0x48), 0x0b, 0x24),
+        (framework::location!(CREATE, 0x75), 0x2e, 0x15),
+        (framework::location!(CREATE, 0x1fa), 0x2f, 0x16),
+    ]
+}
 
 pub(crate) fn log(line: &str) {
     if let Some(host) = HOST.get()
@@ -78,26 +81,17 @@ fn load(host: &'static Host) -> bool {
     }
     let _ = HOST.set(host);
     WANTED.store(host.settings().get_or("enabled", true), Ordering::Relaxed);
+    for (at, old, new) in format_patches() {
+        if let Err(e) = unsafe { host.hooks().patch(host.name(), at, &[old], &[new]) } {
+            log(&format!("depth format patch refused: {e}"));
+            return false;
+        }
+    }
     if let Err(e) = shader::install() {
         log(&format!("replacement shader capture unavailable: {e}"));
     }
     if let Err(e) = vulkan::install() {
         log(&format!("vulkan resolution hooks unavailable: {e}"));
-    }
-    for (offset, old, new) in FORMAT_PATCHES {
-        if let Err(e) = unsafe {
-            host.hooks().patch(
-                host.name(),
-                Location::id(fns::Renderer__CreateDepthStencilObjects, offset),
-                &[old],
-                &[new],
-            )
-        } {
-            log(&format!(
-                "depth format patch at +{offset:#x} refused: {e}; staying off"
-            ));
-            return true;
-        }
     }
     let _ = host.register_command::<ReversedZ>();
     if context::immediate().is_some() {

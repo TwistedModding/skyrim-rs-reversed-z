@@ -21,7 +21,11 @@ use windows::Win32::Graphics::Dxgi::Common::{
 };
 use windows::core::{GUID, Interface, s};
 
-pub(crate) const REVERSED_TARGETS: [usize; 3] = [0, 1, 7];
+pub(crate) const REVERSED_TARGETS: [usize; 3] = [
+    sre::DepthStencilTargetId::scene as usize,
+    sre::DepthStencilTargetId::second as usize,
+    sre::DepthStencilTargetId::screen as usize,
+];
 const STATE: GUID = GUID::from_u128(0xa232cb36_429b_4650_b548_0c28ca56d252);
 const VIEW: GUID = GUID::from_u128(0x9a2b2bf0_1066_4371_8c77_1fbc938e8d43);
 const TARGET: GUID = GUID::from_u128(0x542f353a_264f_4dfe_8199_74ae282df10f);
@@ -161,7 +165,7 @@ pub(crate) fn initialize(device: &ID3D11Device) -> Result<(), String> {
 pub(crate) fn sync_sources() {
     for (slot, target) in SEEDS.iter().zip(REVERSED_TARGETS) {
         slot.store(
-            crate::context::target_field(target, crate::context::TARGET_TEXTURE)
+            crate::context::target_texture(target)
                 .map_or(0, |field| unsafe { *field }),
             Ordering::Relaxed,
         );

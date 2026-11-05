@@ -62,17 +62,6 @@ type DrawIndexedInstancedFn = unsafe extern "system" fn(*mut c_void, u32, u32, u
 type DrawIndirectFn = unsafe extern "system" fn(*mut c_void, *mut c_void, u32);
 type DrawAutoFn = unsafe extern "system" fn(*mut c_void);
 
-/// `Renderer` (`g_Renderer`) per depth target (0x98 bytes each): the texture +0x2018, the
-/// depth view of slice 0 +0x2020, its read-only view +0x2060, the shader view +0x20a0.
-const TARGET_STRIDE: usize = 0x98;
-pub(crate) const TARGET_TEXTURE: usize = 0x2018;
-const TARGET_VIEW: usize = 0x2020;
-/// Address Library id of the engine's current vertex shader record (`SetCurrentVertexShader`
-/// stores it before binding): the D3D shader +0x8, the bytecode size +0x10, the bytecode +0x68.
-const CURRENT_VERTEX_SHADER: u64 = 388_906;
-const RECORD_SHADER: usize = 0x8;
-const RECORD_SIZE: usize = 0x10;
-const RECORD_BYTECODE: usize = 0x68;
 const D3D11_CLEAR_DEPTH: u32 = 1;
 /// Each precise twin receives [near / 15, A - 1, A near, orthographic]; A - 1 as A near / far,
 /// the derivation Drawcall Limit Fix's twins share, so the two paths agree bit for bit.
@@ -182,18 +171,27 @@ pub(crate) fn device() -> Option<ID3D11Device> {
     if let Some(context) = unsafe { ID3D11DeviceContext::from_raw_borrowed(&context) } {
         return unsafe { context.GetDevice() }.ok();
     }
-    let p = unsafe { *(crate::address(globals::g_D3D11Device)? as *const *mut c_void) };
+    let p = unsafe { *(crate::address(sre::id!(globals::g_D3D11Device))? as *const *mut c_void) };
     unsafe { ID3D11Device::from_raw_borrowed(&p) }.cloned()
 }
 
 pub(crate) fn immediate() -> Option<ID3D11DeviceContext> {
-    let p = unsafe { *(crate::address(globals::g_D3D11Context)? as *const *mut c_void) };
+    let p = unsafe { *(crate::address(sre::id!(globals::g_D3D11Context))? as *const *mut c_void) };
     unsafe { ID3D11DeviceContext::from_raw_borrowed(&p) }.cloned()
 }
 
-/// The field at `offset` of depth target `target` in `g_Renderer`.
-pub(crate) fn target_field(target: usize, offset: usize) -> Option<*mut usize> {
-    Some((crate::address(globals::g_Renderer)? + target * TARGET_STRIDE + offset) as *mut usize)
+/// The record of depth target `target` in `g_Renderer`.
+fn target_record(target: usize) -> Option<usize> {
+    Some(
+        crate::address(sre::id!(globals::g_Renderer))?
+            + sre::member_offset!("Renderer.depthStencilTargets")
+            + target * sre::class_size!("DepthStencilRecord", sre::DepthStencilRecord),
+    )
+}
+
+/// The texture pointer of depth target `target`.
+pub(crate) fn target_texture(target: usize) -> Option<*mut usize> {
+    Some((target_record(target)? + sre::member_offset!("DepthStencilRecord.texture")) as *mut usize)
 }
 
 pub(crate) fn install() -> Result<(), String> {
@@ -208,10 +206,12 @@ pub(crate) fn install() -> Result<(), String> {
         crate::log(&format!("replacement shader capture: {e}"));
     }
     CAMERA_STATE.store(
-        crate::address(globals::g_CurrentCameraState).ok_or("no camera state")?,
+        crate::address(sre::id!(globals::g_CurrentCameraState)).ok_or("no camera state")?,
         Ordering::Relaxed,
     );
-    let view = unsafe { *target_field(0, TARGET_VIEW).ok_or("no renderer")? } as *mut c_void;
+    let record = target_record(0).ok_or("no renderer")?;
+    let view =
+        unsafe { *((record + sre::member_offset!("DepthStencilRecord.dsv")) as *const *mut c_void) };
     let view = unsafe { ID3D11DepthStencilView::from_raw_borrowed(&view) }
         .ok_or("the world depth target has no view")?;
     let mut desc = D3D11_DEPTH_STENCIL_VIEW_DESC::default();
@@ -343,8 +343,8 @@ fn with_vertex_constants(context: *mut c_void, draw: impl FnOnce()) {
     }
     let context = unsafe { ID3D11DeviceContext::from_raw_borrowed(&context) }.unwrap();
     let state = CAMERA_STATE.load(Ordering::Relaxed);
-    // SetCurrentCameraState copies entry +0x10 to state +0; projection is entry +0x80.
-    let projection = unsafe { ((state + 0x70) as *const [f32; 16]).read_unaligned() };
+    let at = sre::member_offset!("CurrentCameraState.projection");
+    let projection = unsafe { ((state + at) as *const [f32; 16]).read_unaligned() };
     let near = skyrim::render::depth_shift_near();
     let far = skyrim::render::depth_shift_far();
     let scale = if near > 0.0 { near / VANILLA_NEAR } else { 1.0 };
@@ -1067,17 +1067,19 @@ fn vertex_shader(shader: *mut c_void) -> *mut c_void {
     }
     let original = unsafe { ID3D11VertexShader::from_raw_borrowed(&shader) }.unwrap();
     let twin = crate::shader::mirrored(original, || {
-        let record = crate::address(CURRENT_VERTEX_SHADER)
+        let record = crate::address(sre::id!(globals::g_CurrentVertexShaderRecord))
             .map(|a| unsafe { *(a as *const usize) })
             .filter(|&r| r != 0)?;
-        if unsafe { *((record + RECORD_SHADER) as *const usize) } != shader as usize {
+        let at = sre::member_offset!("VertexShaderRecord.shader");
+        if unsafe { *((record + at) as *const usize) } != shader as usize {
             return None;
         }
         Some(
             unsafe {
                 core::slice::from_raw_parts(
-                    (record + RECORD_BYTECODE) as *const u8,
-                    *((record + RECORD_SIZE) as *const u32) as usize,
+                    (record + sre::member_offset!("VertexShaderRecord.bytecode")) as *const u8,
+                    *((record + sre::member_offset!("VertexShaderRecord.bytecodeSize")) as *const u32)
+                        as usize,
                 )
             }
             .to_vec(),

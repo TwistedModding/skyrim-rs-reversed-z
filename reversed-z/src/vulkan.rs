@@ -425,7 +425,7 @@ pub(crate) fn sync_images() {
     images.clear();
     TRACKED.lock().unwrap().clear();
     for target in crate::copy::REVERSED_TARGETS {
-        let Some(field) = crate::context::target_field(target, crate::context::TARGET_TEXTURE) else {
+        let Some(field) = crate::context::target_texture(target) else {
             continue;
         };
         let texture = unsafe { *field } as *mut c_void;
