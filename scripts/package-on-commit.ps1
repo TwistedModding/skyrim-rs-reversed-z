@@ -1,3 +1,7 @@
+# Copyright (c) 2026 TwistedModding. SPDX-License-Identifier: MPL-2.0-no-copyleft-exception
+# This Source Code Form is subject to the terms of the Mozilla Public License, v. 2.0. If a copy of the MPL was not
+# distributed with this file, You can obtain one at https://mozilla.org/MPL/2.0/.
+# This Source Code Form is "Incompatible With Secondary Licenses", as defined by the Mozilla Public License, v. 2.0.
 # Runs package.ps1 for the git hooks, one run at a time and again if HEAD moved during the build, publishes each clean package to the website and releases it on GitHub, where the Nexus Mods workflow picks it up.
 $Root = Split-Path $PSScriptRoot -Parent
 $running = New-Object Threading.Mutex($false, "Local\package-$($Root -replace '[\\:]', '_')")

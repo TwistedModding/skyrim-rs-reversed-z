@@ -1,3 +1,7 @@
+# Copyright (c) 2026 TwistedModding. SPDX-License-Identifier: MPL-2.0-no-copyleft-exception
+# This Source Code Form is subject to the terms of the Mozilla Public License, v. 2.0. If a copy of the MPL was not
+# distributed with this file, You can obtain one at https://mozilla.org/MPL/2.0/.
+# This Source Code Form is "Incompatible With Secondary Licenses", as defined by the Mozilla Public License, v. 2.0.
 # Builds release and writes dist\reversed-z-<version>.zip: the DLL at its install path and the README.
 # The version is <major.minor>.<commits on HEAD>, with -dirty for a tree with uncommitted changes.
 $ErrorActionPreference = "Stop"
@@ -13,6 +17,7 @@ if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
 $entries = [ordered]@{
     "SKSE/Plugins/skyrim-runtime-extender/reversed_z.dll" = "$Root\target\release\reversed_z.dll"
     "README.md" = "$Root\README.md"
+    "LICENSE.txt" = "$Root\LICENSE"
 }
 New-Item -ItemType Directory -Force "$Root\dist" | Out-Null
 $out = "$Root\dist\reversed-z-$version.zip"

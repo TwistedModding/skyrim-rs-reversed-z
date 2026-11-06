@@ -3,6 +3,7 @@ name = "reversed-z"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
 
 [lib]
 name = "reversed_z"

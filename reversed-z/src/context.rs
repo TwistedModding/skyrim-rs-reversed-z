@@ -1,3 +1,7 @@
+// Copyright (c) 2026 TwistedModding. SPDX-License-Identifier: MPL-2.0-no-copyleft-exception
+// This Source Code Form is subject to the terms of the Mozilla Public License, v. 2.0. If a copy of the MPL was not
+// distributed with this file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// This Source Code Form is "Incompatible With Secondary Licenses", as defined by the Mozilla Public License, v. 2.0.
 //! The immediate context's calls, mirrored while a world depth target is bound: each vertex shader
 //! swapped for its twin (clip z = w - z, [`crate::twin`]), viewport depth ranges [a, b] made
 //! [1 - b, 1 - a], depth tests LESS <-> GREATER, depth biases negated, depth clears 1 - value. Every

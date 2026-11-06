@@ -1,3 +1,7 @@
+// Copyright (c) 2026 TwistedModding. SPDX-License-Identifier: MPL-2.0-no-copyleft-exception
+// This Source Code Form is subject to the terms of the Mozilla Public License, v. 2.0. If a copy of the MPL was not
+// distributed with this file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// This Source Code Form is "Incompatible With Secondary Licenses", as defined by the Mozilla Public License, v. 2.0.
 //! The mirrored twin of a vertex shader (DXBC, shader model 5): the same program with the position's
 //! z replaced by w - z. Every write of the position goes to a temp and the shader ends by writing it
 //! out. Where clip z comes from matrix rows, the twin ends with w - z computed from w and the

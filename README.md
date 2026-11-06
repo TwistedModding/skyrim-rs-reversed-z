@@ -43,3 +43,7 @@ The package version is `<major.minor>.<commit count>`, with `-dirty` when the tr
 ```
 git config core.hooksPath .githooks
 ```
+
+## License
+
+Copyright (c) 2026 TwistedModding, under the Mozilla Public License 2.0 (`LICENSE`), marked "Incompatible With Secondary Licenses" (Exhibit B), so no part of it may be relicensed under the GPL, LGPL or AGPL. It includes skyrim-rs by TwistedModding under the same terms. Third-party components keep their own licenses.
