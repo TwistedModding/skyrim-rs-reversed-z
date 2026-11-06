@@ -96,6 +96,20 @@ impl Operand {
     }
 }
 
+/// The first temp register a twin may use: past the declared count and past every temp the code
+/// touches, since a shader rewritten after compiling (ENB's injected prologues) can use registers
+/// beyond its `dcl_temps`.
+fn temp_base(code: &[Instruction], declared: Option<u32>) -> u32 {
+    code.iter()
+        .flat_map(|ins| &ins.operands)
+        .filter(|o| o.kind == TEMP)
+        .filter_map(Operand::register)
+        .map(|r| r + 1)
+        .chain(declared)
+        .max()
+        .unwrap_or(0)
+}
+
 struct Instruction {
     at: usize,
     len: usize,
@@ -530,7 +544,7 @@ pub(crate) fn mirrored(container: &[u8]) -> Option<Mirrored> {
     let first = code
         .iter()
         .position(|i| !declaration(i.op))?;
-    let base = temps.unwrap_or(0);
+    let base = temp_base(&code, temps);
 
     let position_out = |mask: u8| reg(OUTPUT, position, Some(mask), XYZW, false);
     let temp = |r: u32, c: u8, negated: bool| reg(TEMP, base + r, None, [c; 4], negated);
@@ -574,7 +588,7 @@ pub(crate) fn mirrored(container: &[u8]) -> Option<Mirrored> {
             declared = true;
         }
         if temps.is_none() && n == first {
-            out.extend([DCL_TEMPS | (2 << 24), extra]);
+            out.extend([DCL_TEMPS | (2 << 24), base + extra]);
         }
         if ins.op == DCL_TEMPS {
             body[1] = base + extra;
@@ -703,7 +717,7 @@ pub(crate) fn pixel(container: &[u8]) -> Option<Pixel> {
     if position.is_none() && depth.is_none() {
         return Some(Pixel::Unchanged);
     }
-    let base = temps.unwrap_or(0);
+    let base = temp_base(&code, temps);
     let depth_temp = base + u32::from(position.is_some());
     let extra = u32::from(position.is_some()) + u32::from(depth.is_some());
     let one = [1 | (IMMEDIATE32 << 12), 1.0f32.to_bits()];
@@ -743,7 +757,7 @@ pub(crate) fn pixel(container: &[u8]) -> Option<Pixel> {
         let mut body = tok[ins.at..ins.at + ins.len].to_vec();
         if n == first {
             if temps.is_none() {
-                out.extend([DCL_TEMPS | (2 << 24), extra]);
+                out.extend([DCL_TEMPS | (2 << 24), base + extra]);
             }
             out.extend(&prologue);
         }
@@ -1043,6 +1057,25 @@ pub(crate) mod tests {
     fn a_precise_shader_without_a_free_slot_is_refused() {
         let slots: Vec<u32> = (0..14).filter(|&slot| slot != 2).collect();
         assert!(super::mirrored(&compile(&occupied_slots(&slots))).is_none());
+    }
+
+    #[test]
+    fn twin_temps_start_past_registers_used_beyond_the_declaration() {
+        let source = "float4 main(float4 p : SV_Position, float4 a : TEXCOORD0, float4 b : TEXCOORD1) : SV_Target {             float4 x = a * p.z; float4 y = b * x; float4 z = sin(y) * a; return x + y + z * p.z; }";
+        let mut container = compile_stage(source, s!("ps_5_0"));
+        let (_, at, tok) = super::program(&container).unwrap();
+        let code = super::decode(&tok).unwrap();
+        let used = super::temp_base(&code, None);
+        assert!(used >= 2, "the shader should use several temps, used {used}");
+        let declaration = code.iter().find(|i| i.op == super::DCL_TEMPS).unwrap();
+        let offset = at + (declaration.at + 1) * 4;
+        container[offset..offset + 4].copy_from_slice(&1u32.to_le_bytes());
+        let super::Pixel::Mirrored(rewritten) = super::pixel(&container).unwrap() else {
+            panic!("expected a position rewrite");
+        };
+        let disassembly = text(&rewritten.code);
+        assert!(disassembly.contains(&format!("dcl_temps {}", used + 1)), "{disassembly}");
+        assert!(disassembly.contains(&format!("mov r{used}.z, v0.xyzw")), "{disassembly}");
     }
 
     #[test]
