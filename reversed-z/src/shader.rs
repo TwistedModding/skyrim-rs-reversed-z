@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE, D3D_FEATURE_LEVEL};
 use windows::Win32::Graphics::Direct3D11::{
-    ID3D11Device, ID3D11DeviceChild, ID3D11PixelShader, ID3D11VertexShader,
+    ID3D11Device, ID3D11DeviceChild, ID3D11DomainShader, ID3D11PixelShader, ID3D11VertexShader,
 };
 use windows::Win32::Graphics::Dxgi::DXGI_SWAP_CHAIN_DESC;
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
@@ -66,6 +66,7 @@ static CREATE_DEVICE: Mutex<Option<hook::Hook<CreateDeviceFn>>> = Mutex::new(Non
 static CREATE_SWAP_CHAIN: Mutex<Option<hook::Hook<CreateSwapChainFn>>> = Mutex::new(None);
 static CREATE_VERTEX: Mutex<Option<hook::Hook<CreateVertexFn>>> = Mutex::new(None);
 static CREATE_PIXEL: Mutex<Option<hook::Hook<CreateVertexFn>>> = Mutex::new(None);
+static CREATE_DOMAIN: Mutex<Option<hook::Hook<CreateVertexFn>>> = Mutex::new(None);
 static CAPTURED: AtomicU64 = AtomicU64::new(0);
 static MADE: AtomicU64 = AtomicU64::new(0);
 static PRECISE: AtomicU64 = AtomicU64::new(0);
@@ -150,6 +151,11 @@ pub(crate) fn install_device(device: &ID3D11Device) -> Result<(), String> {
         &CREATE_PIXEL,
         device.vtable().CreatePixelShader as usize,
         create_pixel as CreateVertexFn,
+    )?;
+    install_hook(
+        &CREATE_DOMAIN,
+        device.vtable().CreateDomainShader as usize,
+        create_domain as CreateVertexFn,
     )
 }
 
@@ -161,7 +167,8 @@ pub(crate) fn remove() {
         CREATE_SWAP_CHAIN,
         CREATE_DEVICE,
         CREATE_VERTEX,
-        CREATE_PIXEL
+        CREATE_PIXEL,
+        CREATE_DOMAIN
     );
 }
 
@@ -252,6 +259,7 @@ macro_rules! creation_hook {
 }
 creation_hook!(create_vertex, CREATE_VERTEX);
 creation_hook!(create_pixel, CREATE_PIXEL);
+creation_hook!(create_domain, CREATE_DOMAIN);
 
 fn bytecode(shader: &ID3D11DeviceChild) -> Option<Vec<u8>> {
     let mut size = 0;
@@ -273,6 +281,17 @@ pub(crate) fn mirrored(
         |device| device.vtable().CreateVertexShader,
         true,
     )
+}
+
+pub(crate) fn domain(shader: &ID3D11DomainShader) -> Option<ID3D11DomainShader> {
+    mirror(
+        shader,
+        || None,
+        |code| crate::twin::mirrored_domain(code).map(crate::twin::Pixel::Mirrored),
+        |device| device.vtable().CreateDomainShader,
+        true,
+    )
+    .map(|(shader, _)| shader)
 }
 
 pub(crate) fn pixel(shader: &ID3D11PixelShader) -> Option<ID3D11PixelShader> {

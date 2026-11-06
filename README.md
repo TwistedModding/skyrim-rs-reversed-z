@@ -28,6 +28,10 @@ With the Community Shaders test build that runs the game on DXVK and draws the w
 
 `ReversedZ off` keeps the D32 depth targets created at startup. With Community Shaders, a translucent riverbank band can appear in this mode; the original DLL also reproduces it. For a stock depth-format comparison, disable this mod and restart the game.
 
+## Tessellated terrain
+
+Mods that tessellate the landscape, such as Dynamic Terrain Deformation, place the final vertex in a domain shader. Reversed Z reverses that shader's output instead of the vertex shader's, so raised snow and trails sort correctly. Checked with Dynamic Terrain Deformation 1.2 on all four game versions, alone and with ENB.
+
 ## ENB
 
 With ENB, Reversed Z works on the Direct3D 11 device underneath ENB instead of the one ENB hands the game, so ENB's own passes are reversed too: its terrain blending, and the depth its effects read. `reversed-z.log` says `reversed depth runs on the system's below it`. If that device can't be hooked in a session, the log says so and Reversed Z falls back to the game's device; ENB's terrain blending is then wrong on 1.6.1170, 1.6.353 and 1.5.97 until the next start. Checked with ENB v0.505 and its default settings on all four game versions. ENB's shaders are rewritten at runtime with the permission of ENB's author.

@@ -27,7 +27,7 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_DEPTH_STENCIL_DESC, D3D11_DEPTH_STENCIL_VIEW_DESC, D3D11_DEVICE_CONTEXT_IMMEDIATE, D3D11_DEPTH_WRITE_MASK_ALL,
     D3D11_RASTERIZER_DESC, D3D11_SDK_VERSION, D3D11_USAGE_DEFAULT, D3D11_VIEWPORT, ID3D11Buffer,
     ID3D11DepthStencilState, ID3D11DepthStencilView, ID3D11Device, ID3D11DeviceContext,
-    ID3D11DeviceContext_Vtbl, ID3D11PixelShader, ID3D11RasterizerState, ID3D11RenderTargetView,
+    ID3D11DeviceContext_Vtbl, ID3D11DomainShader, ID3D11PixelShader, ID3D11RasterizerState, ID3D11RenderTargetView,
     ID3D11Resource, ID3D11UnorderedAccessView, ID3D11VertexShader,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
@@ -142,8 +142,10 @@ hooks! {
     CLEAR_DEPTH: ClearDepthFn = ClearDepthStencilView => clear_depth,
     SET_VERTEX_SHADER: SetShaderFn = VSSetShader => set_vertex_shader,
     SET_PIXEL_SHADER: SetShaderFn = PSSetShader => set_pixel_shader,
+    SET_DOMAIN_SHADER: SetShaderFn = DSSetShader => set_domain_shader,
     GET_VERTEX_SHADER: GetShaderFn = VSGetShader => get_vertex_shader,
     GET_PIXEL_SHADER: GetShaderFn = PSGetShader => get_pixel_shader,
+    GET_DOMAIN_SHADER: GetShaderFn = DSGetShader => get_domain_shader,
     SET_PIXEL_RESOURCES: SetResourcesFn = PSSetShaderResources => set_pixel_resources,
     SET_COMPUTE_RESOURCES: SetResourcesFn = CSSetShaderResources => set_compute_resources,
     SET_VERTEX_RESOURCES: SetResourcesFn = VSSetShaderResources => set_vertex_resources,
@@ -171,8 +173,10 @@ static LAST_RASTER: AtomicUsize = AtomicUsize::new(0);
 static LAST_VIEWPORTS: Mutex<Vec<D3D11_VIEWPORT>> = Mutex::new(Vec::new());
 static LAST_VERTEX_SHADER: Mutex<Option<ID3D11VertexShader>> = Mutex::new(None);
 static LAST_PIXEL_SHADER: Mutex<Option<ID3D11PixelShader>> = Mutex::new(None);
+static LAST_DOMAIN_SHADER: Mutex<Option<ID3D11DomainShader>> = Mutex::new(None);
 static VERTEX_INSTANCES: AtomicU32 = AtomicU32::new(0);
 static PIXEL_INSTANCES: AtomicU32 = AtomicU32::new(0);
+static DOMAIN_INSTANCES: AtomicU32 = AtomicU32::new(0);
 static DRAWING: AtomicBool = AtomicBool::new(false);
 static DEPTH_TESTS: AtomicBool = AtomicBool::new(true);
 static VERTEX_CONSTANT_SLOT: AtomicU32 = AtomicU32::new(u32::MAX);
@@ -430,10 +434,19 @@ fn with_shaders(context: *mut c_void, draw: impl FnOnce()) {
         draw();
         return;
     }
-    let vertex = LAST_VERTEX_SHADER.lock().unwrap().clone();
+    let domain = LAST_DOMAIN_SHADER.lock().unwrap().clone();
+    // with tessellation the domain stage writes the position; the vertex stage only feeds patches
+    let vertex = if domain.is_some() {
+        None
+    } else {
+        LAST_VERTEX_SHADER.lock().unwrap().clone()
+    };
     let pixel = LAST_PIXEL_SHADER.lock().unwrap().clone();
     let sources = [
         vertex
+            .as_ref()
+            .map_or(core::ptr::null_mut(), Interface::as_raw),
+        domain
             .as_ref()
             .map_or(core::ptr::null_mut(), Interface::as_raw),
         pixel
@@ -447,13 +460,18 @@ fn with_shaders(context: *mut c_void, draw: impl FnOnce()) {
             vertex_shader as fn(*mut c_void) -> *mut c_void,
         ),
         (
+            &SET_DOMAIN_SHADER,
+            &DOMAIN_INSTANCES,
+            domain_shader as fn(*mut c_void) -> *mut c_void,
+        ),
+        (
             &SET_PIXEL_SHADER,
             &PIXEL_INSTANCES,
             pixel_shader as fn(*mut c_void) -> *mut c_void,
         ),
     ];
     let previous = DRAWING.swap(true, Ordering::Relaxed);
-    let mut changed = [false; 2];
+    let mut changed = [false; 3];
     VERTEX_CONSTANT_SLOT.store(u32::MAX, Ordering::Relaxed);
     for (i, (hook, instances, rewrite)) in stages.iter().enumerate() {
         if instances.load(Ordering::Relaxed) != 0 {
@@ -550,6 +568,7 @@ pub(crate) fn release_push_scale() {
     VERTEX_CONSTANTS.lock().unwrap().take();
     LAST_VERTEX_SHADER.lock().unwrap().take();
     LAST_PIXEL_SHADER.lock().unwrap().take();
+    LAST_DOMAIN_SHADER.lock().unwrap().take();
     LAST_DEPTH_VIEW.lock().unwrap().take();
 }
 
@@ -769,6 +788,32 @@ unsafe extern "system" fn set_vertex_shader(
     unsafe { original(&SET_VERTEX_SHADER)(context, sent, instances, count) };
 }
 
+fn domain_shader(shader: *mut c_void) -> *mut c_void {
+    if !BOUND.load(Ordering::Relaxed) || shader.is_null() {
+        return shader;
+    }
+    let original = unsafe { ID3D11DomainShader::from_raw_borrowed(&shader) }.unwrap();
+    crate::shader::domain(original).map_or(shader, |twin| twin.as_raw())
+}
+
+unsafe extern "system" fn set_domain_shader(
+    context: *mut c_void,
+    shader: *mut c_void,
+    instances: *const *mut c_void,
+    count: u32,
+) {
+    immediate_only!(SET_DOMAIN_SHADER, context, shader, instances, count);
+    *LAST_DOMAIN_SHADER.lock().unwrap() =
+        unsafe { ID3D11DomainShader::from_raw_borrowed(&shader) }.cloned();
+    DOMAIN_INSTANCES.store(count, Ordering::Relaxed);
+    let sent = if count == 0 && DRAWING.load(Ordering::Relaxed) {
+        domain_shader(shader)
+    } else {
+        shader
+    };
+    unsafe { original(&SET_DOMAIN_SHADER)(context, sent, instances, count) };
+}
+
 fn pixel_shader(shader: *mut c_void) -> *mut c_void {
     if !BOUND.load(Ordering::Relaxed) || shader.is_null() {
         return shader;
@@ -826,6 +871,12 @@ shader_getter!(
     GET_PIXEL_SHADER,
     LAST_PIXEL_SHADER,
     ID3D11PixelShader
+);
+shader_getter!(
+    get_domain_shader,
+    GET_DOMAIN_SHADER,
+    LAST_DOMAIN_SHADER,
+    ID3D11DomainShader
 );
 
 #[cfg(test)]
@@ -1079,6 +1130,7 @@ unsafe extern "system" fn clear_state(context: *mut c_void) {
     BOUND_RESOURCE.store(0, Ordering::Relaxed);
     LAST_VERTEX_SHADER.lock().unwrap().take();
     LAST_PIXEL_SHADER.lock().unwrap().take();
+    LAST_DOMAIN_SHADER.lock().unwrap().take();
     LAST_DEPTH_STATE.store(0, Ordering::Relaxed);
     LAST_STENCIL_REF.store(0, Ordering::Relaxed);
     LAST_RASTER.store(0, Ordering::Relaxed);
@@ -1088,6 +1140,7 @@ unsafe extern "system" fn clear_state(context: *mut c_void) {
     DEPTH_TESTS.store(true, Ordering::Relaxed);
     VERTEX_INSTANCES.store(0, Ordering::Relaxed);
     PIXEL_INSTANCES.store(0, Ordering::Relaxed);
+    DOMAIN_INSTANCES.store(0, Ordering::Relaxed);
     if let Some(view) = previous
         && let Ok(resource) = unsafe { view.GetResource() }
     {

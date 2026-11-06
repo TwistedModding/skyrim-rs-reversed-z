@@ -524,8 +524,18 @@ fn replace_chunk(
 
 /// The mirrored twin of vertex shader container `container`, or `None` when it has no position
 /// output or a shape this does not rewrite.
-#[allow(clippy::cast_possible_truncation)]
 pub(crate) fn mirrored(container: &[u8]) -> Option<Mirrored> {
+    rewrite_position(container, true)
+}
+
+/// The mirrored twin of domain shader container `container`: z = w - z at the end, never the
+/// precise form, whose constants are bound on the vertex stage.
+pub(crate) fn mirrored_domain(container: &[u8]) -> Option<Mirrored> {
+    rewrite_position(container, false)
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn rewrite_position(container: &[u8], precise_allowed: bool) -> Option<Mirrored> {
     let (offsets, at, tok) = program(container)?;
     let code = decode(&tok)?;
     let mut position = None;
@@ -556,7 +566,7 @@ pub(crate) fn mirrored(container: &[u8]) -> Option<Mirrored> {
         ],
     );
     let mut constants = None;
-    let after = if let Some((leaf, c)) = clip_z(&code, position) {
+    let after = if let Some((leaf, c)) = clip_z(&code, position).filter(|_| precise_allowed) {
         let slot = (0..14).rev().find(|&slot| {
             !code
                 .iter()
@@ -1076,6 +1086,20 @@ pub(crate) mod tests {
         let disassembly = text(&rewritten.code);
         assert!(disassembly.contains(&format!("dcl_temps {}", used + 1)), "{disassembly}");
         assert!(disassembly.contains(&format!("mov r{used}.z, v0.xyzw")), "{disassembly}");
+    }
+
+    #[test]
+    fn a_domain_shader_twin_writes_w_minus_z_without_constants() {
+        let source = "cbuffer view : register(b0) { float4x4 m; }\n\
+            struct P { float3 p : POSITION; };\n\
+            struct F { float e[3] : SV_TessFactor; float i : SV_InsideTessFactor; };\n\
+            [domain(\"tri\")] float4 main(F f, float3 uvw : SV_DomainLocation, const OutputPatch<P, 3> c) : SV_Position {\n\
+            float3 w = c[0].p * uvw.x + c[1].p * uvw.y + c[2].p * uvw.z; return mul(m, float4(w, 1)); }";
+        let rewritten = super::mirrored_domain(&compile_stage(source, s!("ds_5_0"))).unwrap();
+        let disassembly = text(&rewritten.code);
+        assert!(disassembly.contains("ds_5_0"), "{disassembly}");
+        assert!(!disassembly.contains("cb13") && !disassembly.contains("cb12"), "{disassembly}");
+        assert!(disassembly.contains("add o0.z"), "{disassembly}");
     }
 
     #[test]
