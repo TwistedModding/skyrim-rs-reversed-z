@@ -123,20 +123,21 @@ pub(crate) fn install() -> Result<(), String> {
         unsafe { GetProcAddress(module, s!("D3D11CreateDevice")) }.ok_or("no D3D11CreateDevice")?;
     let swap_chain = unsafe { GetProcAddress(module, s!("D3D11CreateDeviceAndSwapChain")) }
         .ok_or("no D3D11CreateDeviceAndSwapChain")?;
-    install_hook(
-        &CREATE_DEVICE,
-        device as usize,
-        create_device as CreateDeviceFn,
-    )?;
-    if let Err(e) = install_hook(
-        &CREATE_SWAP_CHAIN,
-        swap_chain as usize,
-        create_swap_chain as CreateSwapChainFn,
-    ) {
-        remove();
-        return Err(e);
-    }
-    Ok(())
+    // both are created before either is live, so a failure leaves nothing to remove under a caller
+    let device = unsafe { hook::Hook::create(device as usize, create_device as CreateDeviceFn) }
+        .map_err(|e| e.to_string())?;
+    let swap_chain =
+        match unsafe { hook::Hook::create(swap_chain as usize, create_swap_chain as CreateSwapChainFn) } {
+            Ok(hook) => hook,
+            Err(e) => {
+                let _ = unsafe { device.remove() };
+                return Err(e.to_string());
+            }
+        };
+    *CREATE_DEVICE.lock().unwrap() = Some(device);
+    *CREATE_SWAP_CHAIN.lock().unwrap() = Some(swap_chain);
+    crate::context::enable_created(&CREATE_DEVICE)?;
+    crate::context::enable_created(&CREATE_SWAP_CHAIN)
 }
 
 pub(crate) fn install_device(device: &ID3D11Device) -> Result<(), String> {

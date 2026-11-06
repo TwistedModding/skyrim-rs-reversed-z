@@ -13,7 +13,6 @@
 //! Below a D3D11 wrapper (ENB) the hooks sit on the system's context instead of the game's, so the
 //! wrapper's own draws, depth tests and depth reads are mirrored as the game's are.
 
-use core::cell::Cell;
 use core::ffi::c_void;
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -25,7 +24,7 @@ use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE, D3D_DRIVER_TYPE_WARP};
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_BIND_CONSTANT_BUFFER, D3D11_BUFFER_DESC, D3D11_COMPARISON_FUNC, D3D11_COMPARISON_GREATER,
     D3D11_COMPARISON_GREATER_EQUAL, D3D11_COMPARISON_LESS, D3D11_COMPARISON_LESS_EQUAL,
-    D3D11_DEPTH_STENCIL_DESC, D3D11_DEPTH_STENCIL_VIEW_DESC, D3D11_DEPTH_WRITE_MASK_ALL,
+    D3D11_DEPTH_STENCIL_DESC, D3D11_DEPTH_STENCIL_VIEW_DESC, D3D11_DEVICE_CONTEXT_IMMEDIATE, D3D11_DEPTH_WRITE_MASK_ALL,
     D3D11_RASTERIZER_DESC, D3D11_SDK_VERSION, D3D11_USAGE_DEFAULT, D3D11_VIEWPORT, ID3D11Buffer,
     ID3D11DepthStencilState, ID3D11DepthStencilView, ID3D11Device, ID3D11DeviceContext,
     ID3D11DeviceContext_Vtbl, ID3D11PixelShader, ID3D11RasterizerState, ID3D11RenderTargetView,
@@ -84,14 +83,38 @@ macro_rules! hooks {
     ($($name:ident: $ty:ty = $field:ident => $detour:ident,)*) => {
         $(static $name: Mutex<Option<hook::Hook<$ty>>> = Mutex::new(None);)*
 
-        fn install_hooks(table: &windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext_Vtbl) -> Result<(), String> {
+        /// Creates every hook without enabling one; on a failure the created ones are discarded, which
+        /// is safe because nothing runs through them yet.
+        fn create_hooks(table: &windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext_Vtbl) -> Result<(), String> {
             $(
-                let hook = unsafe { hook::Hook::<$ty>::create(table.$field as usize, $detour as $ty) }.map_err(|e| format!("{}: {e}", stringify!($field)))?;
-                let mut slot = $name.lock().unwrap();
-                // enabled with the slot filled: a call on another thread waits for it instead of finding it empty
-                slot.insert(hook).enable().map_err(|e| format!("{}: {e}", stringify!($field)))?;
+                match unsafe { hook::Hook::<$ty>::create(table.$field as usize, $detour as $ty) } {
+                    Ok(hook) => *$name.lock().unwrap() = Some(hook),
+                    Err(e) => {
+                        remove();
+                        return Err(format!("{}: {e}", stringify!($field)));
+                    }
+                }
             )*
             Ok(())
+        }
+
+        /// Enables the created hooks; each slot is filled first, so a call on another thread finds it.
+        fn enable_hooks() -> Result<(), String> {
+            $(
+                $name
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .ok_or(concat!(stringify!($field), ": not created"))?
+                    .enable()
+                    .map_err(|e| format!("{}: {e}", stringify!($field)))?;
+            )*
+            Ok(())
+        }
+
+        fn install_hooks(table: &windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext_Vtbl) -> Result<(), String> {
+            create_hooks(table)?;
+            enable_hooks()
         }
 
         pub(crate) fn remove() {
@@ -100,7 +123,6 @@ macro_rules! hooks {
                     let _ = unsafe { h.remove() };
                 }
             )*
-            remove_game_hooks();
         }
     };
 }
@@ -231,10 +253,7 @@ pub(crate) fn install() -> Result<(), String> {
             return Ok(());
         }
         Ok(false) => {}
-        Err(e) => {
-            remove();
-            return Err(format!("system context below the game's: {e}"));
-        }
+        Err(e) => return Err(format!("system context below the game's: {e}")),
     }
     IMMEDIATE.store(context.as_raw() as usize, Ordering::Relaxed);
     let device = device().ok_or("no device")?;
@@ -244,11 +263,7 @@ pub(crate) fn install() -> Result<(), String> {
     if let Err(e) = crate::shader::install_device(&device) {
         crate::log(&format!("replacement shader capture: {e}"));
     }
-    if let Err(e) = install_hooks(context.vtable()) {
-        remove();
-        return Err(e);
-    }
-    Ok(())
+    install_hooks(context.vtable())
 }
 
 type CreateDeviceFn = unsafe extern "system" fn(
@@ -266,15 +281,7 @@ type CreateDeviceFn = unsafe extern "system" fn(
 
 /// The hooks are on the system's context below a wrapper's.
 static BELOW_WRAPPER: AtomicBool = AtomicBool::new(false);
-static GAME_TARGETS: Mutex<Option<hook::Hook<SetTargetsFn>>> = Mutex::new(None);
-static GAME_TARGETS_UAV: Mutex<Option<hook::Hook<SetTargetsUavFn>>> = Mutex::new(None);
-/// Each of the game's depth textures with the system's texture behind it.
-static SYSTEM_TEXTURES: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
 static SYSTEM_SETUP_FAILED: AtomicBool = AtomicBool::new(false);
-thread_local! {
-    /// The depth view a bind of the game's is passing down through the wrapper.
-    static GAME_VIEW: Cell<usize> = const { Cell::new(0) };
-}
 
 /// Runs `f` on the system D3D11's immediate context table, read from a WARP device of its own that
 /// lives as long as the call (the table belongs to the device).
@@ -306,8 +313,8 @@ fn with_system_table<R>(f: impl FnOnce(&ID3D11DeviceContext_Vtbl) -> R) -> Optio
 }
 
 /// Hooks the system's context when the game's is a wrapper's (ENB): the wrapper draws with
-/// shaders and depth tests of its own there, past the game's table. The game's table keeps only
-/// its target binds, which name the system's immediate context and textures on their way down.
+/// shaders and depth tests of its own there, past the game's table. The wrapper hands the game
+/// the system's own textures, so the world targets are the same objects on both sides.
 fn install_below_wrapper(game: &ID3D11DeviceContext) -> Result<bool, String> {
     if crate::shader::dxvk().is_some() {
         return Ok(false);
@@ -317,118 +324,51 @@ fn install_below_wrapper(game: &ID3D11DeviceContext) -> Result<bool, String> {
         if table.OMSetDepthStencilState as usize == game.OMSetDepthStencilState as usize {
             return Ok(false);
         }
-        install_hooks(table)?;
-        install_game_hook(&GAME_TARGETS, game.OMSetRenderTargets as usize, game_set_targets as SetTargetsFn)?;
-        install_game_hook(
-            &GAME_TARGETS_UAV,
-            game.OMSetRenderTargetsAndUnorderedAccessViews as usize,
-            game_set_targets_uav as SetTargetsUavFn,
-        )?;
+        if let Err(e) = create_hooks(table) {
+            crate::log(&format!(
+                "the system's context below the game's could not be hooked ({e}); the game's is hooked instead"
+            ));
+            return Ok(false);
+        }
         BELOW_WRAPPER.store(true, Ordering::Relaxed);
+        enable_hooks()?;
         Ok(true)
     })
     .unwrap_or(Ok(false))
 }
 
-fn install_game_hook<F: Copy>(
-    slot: &Mutex<Option<hook::Hook<F>>>,
-    target: usize,
-    detour: F,
-) -> Result<(), String> {
-    let hook = unsafe { hook::Hook::create(target, detour) }.map_err(|e| e.to_string())?;
-    slot.lock().unwrap().insert(hook).enable().map_err(|e| e.to_string())
+/// Enables a hook created into `slot`.
+pub(crate) fn enable_created<F: Copy>(slot: &Mutex<Option<hook::Hook<F>>>) -> Result<(), String> {
+    slot.lock().unwrap().as_ref().ok_or("hook not created")?.enable().map_err(|e| e.to_string())
 }
 
-fn remove_game_hooks() {
-    if let Some(h) = GAME_TARGETS.lock().unwrap().take() {
-        let _ = unsafe { h.remove() };
-    }
-    if let Some(h) = GAME_TARGETS_UAV.lock().unwrap().take() {
-        let _ = unsafe { h.remove() };
-    }
-}
-
-unsafe extern "system" fn game_set_targets(
-    context: *mut c_void,
-    count: u32,
-    views: *const *mut c_void,
-    depth: *mut c_void,
-) {
-    GAME_VIEW.set(depth as usize);
-    unsafe { original(&GAME_TARGETS)(context, count, views, depth) };
-    GAME_VIEW.set(0);
-}
-
-unsafe extern "system" fn game_set_targets_uav(
-    context: *mut c_void,
-    count: u32,
-    views: *const *mut c_void,
-    depth: *mut c_void,
-    uav_start: u32,
-    uav_count: u32,
-    uavs: *const *mut c_void,
-    counts: *const u32,
-) {
-    GAME_VIEW.set(if count == KEEP_TARGETS { 0 } else { depth as usize });
-    unsafe {
-        original(&GAME_TARGETS_UAV)(
-            context, count, views, depth, uav_start, uav_count, uavs, counts,
-        );
-    };
-    GAME_VIEW.set(0);
-}
-
-/// Below a wrapper, a bind of the game's reaching the system's context: the first names the
-/// system's immediate context, which the objects of this module are then made on; each pairs the
-/// game's depth texture with the system's.
+/// Below a wrapper, the first bind of a world depth target on an immediate context names the
+/// system's context the game draws on; the objects of this module are then made on its device.
 fn learn(context: *mut c_void, view: *mut c_void) {
-    let game = GAME_VIEW.replace(0);
-    if game == 0 {
+    if IMMEDIATE.load(Ordering::Relaxed) != 0
+        || !BELOW_WRAPPER.load(Ordering::Relaxed)
+        || SYSTEM_SETUP_FAILED.load(Ordering::Relaxed)
+    {
         return;
     }
-    if IMMEDIATE.load(Ordering::Relaxed) == 0 {
-        if SYSTEM_SETUP_FAILED.load(Ordering::Relaxed) {
-            return;
-        }
-        let device = unsafe { ID3D11DeviceContext::from_raw_borrowed(&context) }
-            .and_then(|c| unsafe { c.GetDevice() }.ok());
-        let made = device.ok_or_else(|| "no device".to_owned()).and_then(|device| {
-            create_vertex_constants(&device)?;
-            crate::copy::initialize(&device)
-        });
-        if let Err(e) = made {
-            SYSTEM_SETUP_FAILED.store(true, Ordering::Relaxed);
-            crate::log(&format!("not engaged on the system's context: {e}"));
-            return;
-        }
-        IMMEDIATE.store(context as usize, Ordering::Relaxed);
-    }
-    if context as usize != IMMEDIATE.load(Ordering::Relaxed) {
+    let Some(resource) = depth_resource(view) else { return };
+    let world = crate::copy::REVERSED_TARGETS
+        .into_iter()
+        .any(|t| target_texture(t).is_some_and(|field| unsafe { *field } == resource.as_raw() as usize));
+    let Some(c) = (unsafe { ID3D11DeviceContext::from_raw_borrowed(&context) }) else { return };
+    if !world || unsafe { c.GetType() } != D3D11_DEVICE_CONTEXT_IMMEDIATE {
         return;
     }
-    if let (Some(game), Some(system)) = (depth_resource(game as *mut c_void), depth_resource(view)) {
-        let pair = (game.as_raw() as usize, system.as_raw() as usize);
-        let mut textures = SYSTEM_TEXTURES.lock().unwrap();
-        if !textures.contains(&pair) {
-            textures.retain(|&(game, _)| game != pair.0);
-            textures.push(pair);
-        }
+    let made = unsafe { c.GetDevice() }.map_err(|e| e.to_string()).and_then(|device| {
+        create_vertex_constants(&device)?;
+        crate::copy::initialize(&device)
+    });
+    if let Err(e) = made {
+        SYSTEM_SETUP_FAILED.store(true, Ordering::Relaxed);
+        crate::log(&format!("not engaged on the system's context: {e}"));
+        return;
     }
-}
-
-/// The texture of depth target `target` as the hooks see it: the engine's, or below a wrapper the
-/// system's behind it once a bind has named it.
-pub(crate) fn world_texture(target: usize) -> usize {
-    let game = target_texture(target).map_or(0, |field| unsafe { *field });
-    if !BELOW_WRAPPER.load(Ordering::Relaxed) {
-        return game;
-    }
-    SYSTEM_TEXTURES
-        .lock()
-        .unwrap()
-        .iter()
-        .find(|&&(engine, _)| engine == game)
-        .map_or(0, |&(_, system)| system)
+    IMMEDIATE.store(context as usize, Ordering::Relaxed);
 }
 
 fn depth_resource(view: *mut c_void) -> Option<ID3D11Resource> {
@@ -1391,11 +1331,7 @@ pub(crate) fn counters() -> String {
     };
     format!(
         "{}{}, depth state twins {}, raster twins {}, world depth clears {}, {}",
-        if BELOW_WRAPPER.load(Ordering::Relaxed) {
-            format!("below a wrapper ({} depth textures named), ", SYSTEM_TEXTURES.lock().unwrap().len())
-        } else {
-            String::new()
-        },
+        if BELOW_WRAPPER.load(Ordering::Relaxed) { "below a wrapper, " } else { "" },
         crate::shader::counters(),
         twins(&MIRRORED_DEPTH),
         twins(&MIRRORED_RASTER),

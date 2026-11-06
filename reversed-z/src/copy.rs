@@ -168,7 +168,11 @@ pub(crate) fn initialize(device: &ID3D11Device) -> Result<(), String> {
 
 pub(crate) fn sync_sources() {
     for (slot, target) in SEEDS.iter().zip(REVERSED_TARGETS) {
-        slot.store(crate::context::world_texture(target), Ordering::Relaxed);
+        slot.store(
+            crate::context::target_texture(target)
+                .map_or(0, |field| unsafe { *field }),
+            Ordering::Relaxed,
+        );
     }
 }
 
