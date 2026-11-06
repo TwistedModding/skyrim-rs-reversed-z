@@ -15,8 +15,9 @@ use windows::Win32::Graphics::Direct3D11::{
     ID3D11Device, ID3D11DeviceChild, ID3D11PixelShader, ID3D11VertexShader,
 };
 use windows::Win32::Graphics::Dxgi::DXGI_SWAP_CHAIN_DESC;
-use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
-use windows::core::{GUID, HRESULT, Interface, s, w};
+use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
+use windows::Win32::System::SystemInformation::GetSystemDirectoryW;
+use windows::core::{GUID, HRESULT, Interface, PCWSTR, s, w};
 
 use crate::context::original;
 
@@ -96,12 +97,28 @@ fn install_hook<F: Copy>(
     Ok(())
 }
 
-/// Hooks device creation on DXVK's D3D11 when Community Shaders loaded it, else the system's.
+/// DXVK's D3D11, loaded by Community Shaders.
+pub(crate) fn dxvk() -> Option<HMODULE> {
+    unsafe { GetModuleHandleW(w!("dxvk_d3d11.dll")) }.ok()
+}
+
+/// The system's own D3D11, by its full path: a wrapper in the game folder (ENB) takes the name.
+pub(crate) fn system_d3d11() -> Option<HMODULE> {
+    let mut dir = [0u16; 260];
+    let len = unsafe { GetSystemDirectoryW(Some(&mut dir)) } as usize;
+    let path: Vec<u16> = dir[..len]
+        .iter()
+        .copied()
+        .chain("\\d3d11.dll".encode_utf16())
+        .chain(Some(0))
+        .collect();
+    unsafe { LoadLibraryW(PCWSTR(path.as_ptr())) }.ok()
+}
+
+/// Hooks device creation on DXVK's D3D11 when Community Shaders loaded it, else the system's, so
+/// bytecode is captured on the device every draw finally reaches.
 pub(crate) fn install() -> Result<(), String> {
-    let module = [w!("dxvk_d3d11.dll"), w!("d3d11.dll")]
-        .into_iter()
-        .find_map(|name| unsafe { GetModuleHandleW(name) }.ok())
-        .ok_or("no D3D11 module")?;
+    let module = dxvk().or_else(system_d3d11).ok_or("no D3D11 module")?;
     let device =
         unsafe { GetProcAddress(module, s!("D3D11CreateDevice")) }.ok_or("no D3D11CreateDevice")?;
     let swap_chain = unsafe { GetProcAddress(module, s!("D3D11CreateDeviceAndSwapChain")) }
