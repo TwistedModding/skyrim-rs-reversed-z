@@ -46,7 +46,7 @@ powershell -File scripts\package.ps1
 
 skyrim-rs is a submodule at `extern/skyrim-rs` (`git submodule update --init` in an existing clone). The DLL lands in `target\release\`; the package script writes `dist\reversed-z-<version>.zip` with the DLL at its install path and this README.
 
-The package version is `<major.minor>.<commit count>`, with `-dirty` when the tree has uncommitted changes. To package every commit and merge on `master` in the background, with the output in `dist\package.log`, enable the hooks once per clone:
+The package version is `<major.minor>.<commits since major.minor was set>`, with `-dirty` when the tree has uncommitted changes. To package every commit and merge on `master` in the background, with the output in `dist\package.log`, enable the hooks once per clone:
 
 ```
 git config core.hooksPath .githooks

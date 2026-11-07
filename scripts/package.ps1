@@ -3,12 +3,13 @@
 # distributed with this file, You can obtain one at https://mozilla.org/MPL/2.0/.
 # This Source Code Form is "Incompatible With Secondary Licenses", as defined by the Mozilla Public License, v. 2.0.
 # Builds release and writes dist\reversed-z-<version>.zip: the DLL at its install path and the README.
-# The version is <major.minor>.<commits on HEAD>, with -dirty for a tree with uncommitted changes.
+# The version is <major.minor>.<commits since the commit that set major.minor>, with -dirty for a tree with uncommitted changes.
 $ErrorActionPreference = "Stop"
 $Root = Split-Path $PSScriptRoot -Parent
-$Release = "0.3"
-$commits = git -C $Root rev-list --count HEAD
-if ($LASTEXITCODE -ne 0) { throw "git rev-list failed" }
+$Release = "1.0"
+$since = git -C $Root log -1 --format=%H -G '^\$Release = ' -- scripts/package.ps1
+$commits = git -C $Root rev-list --count "$since..HEAD"
+if ($LASTEXITCODE -ne 0 -or -not $since) { throw "git log failed" }
 $version = "$Release.$commits"
 if (git -C $Root status --porcelain) { $version += "-dirty" }
 $env:SKYRIM_RS_VERSION = $version
