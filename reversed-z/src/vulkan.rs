@@ -16,7 +16,7 @@
 
 use core::ffi::{CStr, c_char, c_void};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex, OnceLock};
 
 use ash::vk;
@@ -117,6 +117,7 @@ static SET_BIAS: AtomicUsize = AtomicUsize::new(0);
 static OWN_RANGE: OnceLock<(usize, usize)> = OnceLock::new();
 static CS_RANGE: OnceLock<(usize, usize)> = OnceLock::new();
 static RESOLVED: AtomicU64 = AtomicU64::new(0);
+static ENGAGED: AtomicBool = AtomicBool::new(false);
 static WORLD_PIPELINES: AtomicU64 = AtomicU64::new(0);
 static WORLD_RENDERINGS: AtomicU64 = AtomicU64::new(0);
 static WORLD_VIEWS: AtomicU64 = AtomicU64::new(0);
@@ -379,8 +380,12 @@ unsafe fn release(object: *mut c_void) {
     unsafe { release(object) };
 }
 
-/// Finds the world depth images on DXVK's device and the dynamic-state setters.
+/// Finds the world depth images on DXVK's device and the dynamic-state setters, when Community
+/// Shaders draws through Vulkan.
 pub(crate) fn engage() -> Result<String, String> {
+    if RESOLVED.load(Ordering::Relaxed) == 0 {
+        return Err("Community Shaders resolved no Vulkan entry points; nothing draws past the context".into());
+    }
     let d3d = crate::context::device().ok_or("no device")?;
     let interop = unsafe { query(&d3d, &INTEROP_DEVICE) }
         .ok_or("the D3D11 device is not DXVK's; nothing draws past the context")?;
@@ -414,6 +419,7 @@ pub(crate) fn engage() -> Result<String, String> {
     }
     crate::stream::setup(device, gpa)?;
     sync_images();
+    ENGAGED.store(true, Ordering::Release);
     let images = IMAGES.lock().unwrap();
     let formats: Vec<i32> = images.values().map(|w| w.format.as_raw()).collect();
     Ok(format!(
@@ -452,7 +458,7 @@ pub(crate) fn sync_images() {
 /// Adds a texture that holds depth copied from a world target, so descriptors sampling it are
 /// pointed at its conventional copy as well.
 pub(crate) fn track(resource: &ID3D11Resource) {
-    if !TRACKED.lock().unwrap().insert(resource.as_raw() as usize) {
+    if !ENGAGED.load(Ordering::Acquire) || !TRACKED.lock().unwrap().insert(resource.as_raw() as usize) {
         return;
     }
     if let Some((image, _, info)) = vulkan_image(resource) {
