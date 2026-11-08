@@ -4,7 +4,7 @@ A Skyrim Runtime Extender plugin that draws the world view in reversed Z into 32
 
 ## Requirements
 
-- Skyrim Special Edition 1.7.104, 1.6.1170, 1.6.353 or 1.5.97 from Steam, with the script extender and Address Library file the loader's README lists for that version.
+- Skyrim Special Edition 1.7.104, 1.6.1170, 1.6.353 or 1.5.97 from Steam, or 1.6.1179 from GOG, with the script extender and Address Library file the loader's README lists for that version.
 - The Skyrim Runtime Extender loader (`Data\SKSE\Plugins\skyrim_runtime_extender.dll`), 0.6 or later, from its own package.
 
 ## Install
