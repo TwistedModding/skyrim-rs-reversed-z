@@ -1482,3 +1482,163 @@ pub(crate) fn counters() -> String {
         crate::copy::counters()
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::twin::tests::{compile, compile_stage};
+    use windows::Win32::Graphics::Direct3D::{
+        D3D_DRIVER_TYPE_HARDWARE, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
+    };
+    use windows::Win32::Graphics::Direct3D11::*;
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32G8X24_TYPELESS, DXGI_SAMPLE_DESC};
+
+    /// CPU time per draw sent through the hooks with a world target bound, against the same draws
+    /// with no hooks. `cargo test --release -p reversed-z per_draw_cost -- --ignored --nocapture`
+    #[test]
+    #[ignore = "benchmark on the hardware device"]
+    #[allow(clippy::too_many_lines)]
+    fn per_draw_cost() {
+        crate::shader::install().unwrap();
+        let (mut device, mut context) = (None, None);
+        unsafe {
+            D3D11CreateDevice(
+                None,
+                D3D_DRIVER_TYPE_HARDWARE,
+                HMODULE::default(),
+                D3D11_CREATE_DEVICE_FLAG(0),
+                None,
+                D3D11_SDK_VERSION,
+                Some(&raw mut device),
+                None,
+                Some(&raw mut context),
+            )
+        }
+        .unwrap();
+        let (device, context) = (device.unwrap(), context.unwrap());
+        let vertex: Vec<ID3D11VertexShader> = [0.25, 0.5]
+            .map(|z| {
+                let code = compile(&format!(
+                    "float4 main(uint id : SV_VertexID) : SV_Position {{ return float4(0, 0, {z}, 1); }}"
+                ));
+                let mut shader = None;
+                unsafe { device.CreateVertexShader(&code, None, Some(&raw mut shader)) }.unwrap();
+                shader.unwrap()
+            })
+            .into();
+        let pixel: Vec<ID3D11PixelShader> = ["p.zzzz", "p.zzzz * 0.5"]
+            .map(|expression| {
+                let code = compile_stage(
+                    &format!(
+                        "float4 main(float4 p : SV_Position) : SV_Target {{ return {expression}; }}"
+                    ),
+                    s!("ps_5_0"),
+                );
+                let mut shader = None;
+                unsafe { device.CreatePixelShader(&code, None, Some(&raw mut shader)) }.unwrap();
+                shader.unwrap()
+            })
+            .into();
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: 64,
+            Height: 64,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_R32G8X24_TYPELESS,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: (D3D11_BIND_DEPTH_STENCIL.0 | D3D11_BIND_SHADER_RESOURCE.0).cast_unsigned(),
+            ..Default::default()
+        };
+        let mut depth = None;
+        unsafe { device.CreateTexture2D(&raw const desc, None, Some(&raw mut depth)) }.unwrap();
+        let depth = depth.unwrap();
+        let view_desc = D3D11_DEPTH_STENCIL_VIEW_DESC {
+            Format: DXGI_FORMAT_D32_FLOAT_S8X24_UINT,
+            ViewDimension: D3D11_DSV_DIMENSION_TEXTURE2D,
+            ..Default::default()
+        };
+        let mut view = None;
+        unsafe {
+            device.CreateDepthStencilView(&depth, Some(&raw const view_desc), Some(&raw mut view))
+        }
+        .unwrap();
+        let view = view.unwrap();
+        let state_desc = D3D11_DEPTH_STENCIL_DESC {
+            DepthEnable: true.into(),
+            DepthWriteMask: D3D11_DEPTH_WRITE_MASK_ALL,
+            DepthFunc: D3D11_COMPARISON_LESS,
+            ..Default::default()
+        };
+        let mut state = None;
+        unsafe { device.CreateDepthStencilState(&raw const state_desc, Some(&raw mut state)) }
+            .unwrap();
+        let viewport = D3D11_VIEWPORT {
+            Width: 64.0,
+            Height: 64.0,
+            MaxDepth: 1.0,
+            ..Default::default()
+        };
+
+        // the fastest of several short runs, so other work on the machine and the GPU drops out
+        let best = |draw: &dyn Fn(u32)| {
+            const DRAWS: u32 = 20_000;
+            (0..9)
+                .map(|_| {
+                    unsafe { context.Flush() };
+                    let start = std::time::Instant::now();
+                    for i in 0..DRAWS {
+                        draw(i);
+                    }
+                    start.elapsed().as_nanos() / u128::from(DRAWS)
+                })
+                .min()
+                .unwrap()
+        };
+        let run = |label: &str| {
+            unsafe {
+                context.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                context.OMSetDepthStencilState(state.as_ref(), 0);
+                context.RSSetViewports(Some(&[viewport]));
+                context.OMSetRenderTargets(None, &view);
+                context.VSSetShader(&vertex[0], None);
+                context.PSSetShader(&pixel[0], None);
+            }
+            let same = best(&|_| unsafe { context.Draw(3, 0) });
+            let changing = best(&|i| unsafe {
+                context.VSSetShader(&vertex[(i & 1) as usize], None);
+                context.PSSetShader(&pixel[(i & 1) as usize], None);
+                context.Draw(3, 0);
+            });
+            println!("{label}: {same} ns per draw, {changing} with shaders changing every draw");
+            unsafe { context.ClearState() };
+        };
+        run("warm-up");
+        crate::copy::initialize(&device).unwrap();
+        create_vertex_constants(&device).unwrap();
+        for _ in 0..2 {
+            run("no hooks");
+            install_test_hooks(&context);
+            crate::copy::mark(&depth.cast().unwrap(), true);
+            run("hooks, world bound");
+            unsafe {
+                context.OMSetRenderTargets(None, &view);
+                context.VSSetShader(&vertex[0], None);
+            }
+            let plain = best(&|_| unsafe { context.Draw(3, 0) });
+            let constants = best(&|_| {
+                place_constants(&context, Some((13, [1.0, 2.0, 3.0, 4.0])));
+                unsafe { context.Draw(3, 0) };
+            });
+            place_constants(&context, None);
+            println!("hooks, private constants: {constants} ns per draw against {plain}");
+            unsafe { context.ClearState() };
+            remove();
+        }
+        crate::copy::release();
+        crate::shader::remove();
+    }
+}
