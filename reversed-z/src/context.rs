@@ -8,7 +8,8 @@
 //! depth the world targets hold is then 1 - the vanilla value. Their standard copies
 //! ([`crate::copy`]) are refreshed when a written world view is unbound (readers cannot sample a
 //! depth target bound for writing) and after the engine copies the scene depth into another target.
-//! Each precise twin receives private constants for the bound camera during its draw.
+//! Twins are bound when the engine binds a shader or the state changes, not per draw, and each
+//! precise twin's private camera constants stay bound between its draws.
 //!
 //! Below a D3D11 wrapper (ENB) the hooks sit on the system's context instead of the game's, so the
 //! wrapper's own draws, depth tests and depth reads are mirrored as the game's are.
@@ -52,6 +53,7 @@ type ClearDepthFn = unsafe extern "system" fn(*mut c_void, *mut c_void, u32, f32
 type SetShaderFn = unsafe extern "system" fn(*mut c_void, *mut c_void, *const *mut c_void, u32);
 type GetShaderFn =
     unsafe extern "system" fn(*mut c_void, *mut *mut c_void, *mut *mut c_void, *mut u32);
+type GetConstantsFn = unsafe extern "system" fn(*mut c_void, u32, u32, *mut *mut c_void);
 type CopyFn = unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void);
 type CopyRegionFn = unsafe extern "system" fn(
     *mut c_void,
@@ -146,6 +148,7 @@ hooks! {
     GET_VERTEX_SHADER: GetShaderFn = VSGetShader => get_vertex_shader,
     GET_PIXEL_SHADER: GetShaderFn = PSGetShader => get_pixel_shader,
     GET_DOMAIN_SHADER: GetShaderFn = DSGetShader => get_domain_shader,
+    GET_VERTEX_CONSTANTS: GetConstantsFn = VSGetConstantBuffers => get_vertex_constants,
     SET_PIXEL_RESOURCES: SetResourcesFn = PSSetShaderResources => set_pixel_resources,
     SET_COMPUTE_RESOURCES: SetResourcesFn = CSSetShaderResources => set_compute_resources,
     SET_VERTEX_RESOURCES: SetResourcesFn = VSSetShaderResources => set_vertex_resources,
@@ -177,7 +180,11 @@ static LAST_DOMAIN_SHADER: Mutex<Option<ID3D11DomainShader>> = Mutex::new(None);
 static VERTEX_INSTANCES: AtomicU32 = AtomicU32::new(0);
 static PIXEL_INSTANCES: AtomicU32 = AtomicU32::new(0);
 static DOMAIN_INSTANCES: AtomicU32 = AtomicU32::new(0);
-static DRAWING: AtomicBool = AtomicBool::new(false);
+const VERTEX: u8 = 1;
+const DOMAIN: u8 = 2;
+const PIXEL: u8 = 4;
+/// `copy::count() + 1` when the bound target was last marked as drawn into, 0 when not since bind.
+static MARKED: AtomicU64 = AtomicU64::new(0);
 static DEPTH_TESTS: AtomicBool = AtomicBool::new(true);
 static VERTEX_CONSTANT_SLOT: AtomicU32 = AtomicU32::new(u32::MAX);
 static LAST_DEPTH_VIEW: Mutex<Option<ID3D11DepthStencilView>> = Mutex::new(None);
@@ -191,8 +198,11 @@ static DEPTH_MODES: Mutex<Option<HashMap<usize, (bool, bool)>>> = Mutex::new(Non
 struct VertexConstants {
     buffer: ID3D11Buffer,
     sent: [u32; 4],
+    /// The slot the buffer stays bound at between draws, and the buffer it displaced there.
+    placed: Option<(u32, Option<ID3D11Buffer>)>,
 }
 static VERTEX_CONSTANTS: Mutex<Option<VertexConstants>> = Mutex::new(None);
+static CONSTANTS_PLACED: AtomicBool = AtomicBool::new(false);
 static CAMERA_STATE: AtomicUsize = AtomicUsize::new(0);
 static CLEARS: AtomicU64 = AtomicU64::new(0);
 
@@ -403,9 +413,11 @@ fn bind(context: *mut c_void, view: *mut c_void) {
         Ordering::Relaxed,
     );
     let bound = resource.as_ref().is_some_and(crate::copy::reversed);
+    MARKED.store(0, Ordering::Relaxed);
     if BOUND.swap(bound, Ordering::Relaxed) == bound {
         return;
     }
+    resend(context, VERTEX | DOMAIN | PIXEL);
     if let (true, Some(resource)) = (bound, &resource) {
         let context = unsafe { ID3D11DeviceContext::from_raw_borrowed(&context) }.unwrap();
         crate::copy::ensure(context, resource);
@@ -429,79 +441,103 @@ fn bind(context: *mut c_void, view: *mut c_void) {
     }
 }
 
-fn with_shaders(context: *mut c_void, draw: impl FnOnce()) {
-    if !BOUND.load(Ordering::Relaxed) || !DEPTH_TESTS.load(Ordering::Relaxed) {
-        draw();
-        return;
-    }
-    let domain = LAST_DOMAIN_SHADER.lock().unwrap().clone();
-    // with tessellation the domain stage writes the position; the vertex stage only feeds patches
-    let vertex = if domain.is_some() {
-        None
-    } else {
-        LAST_VERTEX_SHADER.lock().unwrap().clone()
-    };
-    let pixel = LAST_PIXEL_SHADER.lock().unwrap().clone();
-    let sources = [
-        vertex
-            .as_ref()
-            .map_or(core::ptr::null_mut(), Interface::as_raw),
-        domain
-            .as_ref()
-            .map_or(core::ptr::null_mut(), Interface::as_raw),
-        pixel
-            .as_ref()
-            .map_or(core::ptr::null_mut(), Interface::as_raw),
-    ];
-    let stages = [
-        (
+/// Sends `stages` the engine's shader, or its twin while a depth-tested world view is bound. Done
+/// when the shader or the state changes, not per draw: the runtime switches the context's draw entry
+/// points with some states, so a draw may pass the draw hooks.
+fn resend(context: *mut c_void, stages: u8) {
+    let mirrored = mirrored();
+    if stages & VERTEX != 0 {
+        // with tessellation the domain stage writes the position; the vertex stage only feeds patches
+        let tessellated = LAST_DOMAIN_SHADER.lock().unwrap().is_some();
+        VERTEX_CONSTANT_SLOT.store(u32::MAX, Ordering::Relaxed);
+        send(
+            context,
             &SET_VERTEX_SHADER,
             &VERTEX_INSTANCES,
-            vertex_shader as fn(*mut c_void) -> *mut c_void,
-        ),
-        (
+            raw(&LAST_VERTEX_SHADER),
+            mirrored && !tessellated,
+            vertex_shader,
+        );
+    }
+    if stages & DOMAIN != 0 {
+        send(
+            context,
             &SET_DOMAIN_SHADER,
             &DOMAIN_INSTANCES,
-            domain_shader as fn(*mut c_void) -> *mut c_void,
-        ),
-        (
+            raw(&LAST_DOMAIN_SHADER),
+            mirrored,
+            domain_shader,
+        );
+    }
+    if stages & PIXEL != 0 {
+        send(
+            context,
             &SET_PIXEL_SHADER,
             &PIXEL_INSTANCES,
-            pixel_shader as fn(*mut c_void) -> *mut c_void,
-        ),
-    ];
-    let previous = DRAWING.swap(true, Ordering::Relaxed);
-    let mut changed = [false; 3];
-    VERTEX_CONSTANT_SLOT.store(u32::MAX, Ordering::Relaxed);
-    for (i, (hook, instances, rewrite)) in stages.iter().enumerate() {
-        if instances.load(Ordering::Relaxed) != 0 {
-            crate::copy::report("dynamic shader linkage is unsupported for reversed depth");
-        } else if !sources[i].is_null() {
-            unsafe { original(hook)(context, rewrite(sources[i]), core::ptr::null(), 0) };
-            changed[i] = true;
-        }
-    }
-    with_vertex_constants(context, draw);
-    DRAWING.store(previous, Ordering::Relaxed);
-    for (i, (hook, _, _)) in stages.iter().enumerate() {
-        if changed[i] {
-            let source = if previous {
-                stages[i].2(sources[i])
-            } else {
-                sources[i]
-            };
-            unsafe { original(hook)(context, source, core::ptr::null(), 0) };
-        }
+            raw(&LAST_PIXEL_SHADER),
+            mirrored,
+            pixel_shader,
+        );
     }
 }
 
-fn with_vertex_constants(context: *mut c_void, draw: impl FnOnce()) {
-    let slot = VERTEX_CONSTANT_SLOT.load(Ordering::Relaxed);
-    if slot == u32::MAX || !BOUND.load(Ordering::Relaxed) {
-        draw();
+fn mirrored() -> bool {
+    BOUND.load(Ordering::Relaxed) && DEPTH_TESTS.load(Ordering::Relaxed)
+}
+
+/// The engine's shader for a stage, kept alive by the stage's record.
+fn raw<I: Interface>(last: &Mutex<Option<I>>) -> *mut c_void {
+    last.lock()
+        .unwrap()
+        .as_ref()
+        .map_or(core::ptr::null_mut(), Interface::as_raw)
+}
+
+fn send(
+    context: *mut c_void,
+    hook: &Mutex<Option<hook::Hook<SetShaderFn>>>,
+    instances: &AtomicU32,
+    shader: *mut c_void,
+    mirror: bool,
+    twin: fn(*mut c_void) -> *mut c_void,
+) {
+    // a shader with class instances is sent as given
+    if instances.load(Ordering::Relaxed) != 0 {
+        if mirror {
+            crate::copy::report("dynamic shader linkage is unsupported for reversed depth");
+        }
         return;
     }
-    let context = unsafe { ID3D11DeviceContext::from_raw_borrowed(&context) }.unwrap();
+    let sent = if mirror { twin(shader) } else { shader };
+    unsafe { original(hook)(context, sent, core::ptr::null(), 0) };
+}
+
+fn set_stage(
+    context: *mut c_void,
+    hook: &Mutex<Option<hook::Hook<SetShaderFn>>>,
+    stage: u8,
+    shader: *mut c_void,
+    instances: (*const *mut c_void, u32, &AtomicU32),
+) {
+    let (list, count, stored) = instances;
+    stored.store(count, Ordering::Relaxed);
+    if count == 0 {
+        resend(context, stage);
+    } else {
+        unsafe { original(hook)(context, shader, list, count) };
+    }
+}
+
+fn with_vertex_constants(context: *mut c_void) {
+    let slot = VERTEX_CONSTANT_SLOT.load(Ordering::Relaxed);
+    let wanted = slot != u32::MAX && BOUND.load(Ordering::Relaxed);
+    if wanted || CONSTANTS_PLACED.load(Ordering::Relaxed) {
+        let context = unsafe { ID3D11DeviceContext::from_raw_borrowed(&context) }.unwrap();
+        place_constants(context, wanted.then(|| (slot, camera_constants())));
+    }
+}
+
+fn camera_constants() -> [f32; 4] {
     let state = CAMERA_STATE.load(Ordering::Relaxed);
     let at = sre::member_offset!("CurrentCameraState.projection");
     let projection = unsafe { ((state + at) as *const [f32; 16]).read_unaligned() };
@@ -509,9 +545,12 @@ fn with_vertex_constants(context: *mut c_void, draw: impl FnOnce()) {
     let far = skyrim::render::depth_shift_far();
     let scale = if near > 0.0 { near / VANILLA_NEAR } else { 1.0 };
     let a_near = -projection[14];
-    let a_less_one = if far > 0.0 { a_near / far } else { projection[10] - 1.0 };
-    let data = [scale, a_less_one, a_near, projection[15]];
-    draw_with_constants(context, slot, data, draw);
+    let a_less_one = if far > 0.0 {
+        a_near / far
+    } else {
+        projection[10] - 1.0
+    };
+    [scale, a_less_one, a_near, projection[15]]
 }
 
 pub(crate) fn create_vertex_constants(device: &ID3D11Device) -> Result<(), String> {
@@ -527,32 +566,57 @@ pub(crate) fn create_vertex_constants(device: &ID3D11Device) -> Result<(), Strin
     *VERTEX_CONSTANTS.lock().unwrap() = Some(VertexConstants {
         buffer: buffer.ok_or("no vertex depth constants")?,
         sent: [0; 4],
+        placed: None,
     });
+    CONSTANTS_PLACED.store(false, Ordering::Relaxed);
     Ok(())
 }
 
-pub(crate) fn draw_with_constants(
-    context: &ID3D11DeviceContext,
-    slot: u32,
-    data: [f32; 4],
-    draw: impl FnOnce(),
-) {
-    let bits = data.map(f32::to_bits);
+/// The vertex constant buffer bound at `slot`, read past the hook.
+fn vertex_constants_at(context: &ID3D11DeviceContext, slot: u32) -> Option<ID3D11Buffer> {
+    let get = GET_VERTEX_CONSTANTS
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map_or(context.vtable().VSGetConstantBuffers, hook::Hook::original);
+    let mut buffer: *mut c_void = core::ptr::null_mut();
+    unsafe { get(context.as_raw(), slot, 1, (&raw mut buffer).cast()) };
+    (!buffer.is_null()).then(|| unsafe { ID3D11Buffer::from_raw(buffer) })
+}
+
+/// Binds the private constants `data` at `slot` for the next draws, or with `None` gives the slot
+/// back the buffer they displaced. The binding stays across draws until another slot or none is
+/// wanted; a buffer the engine bound over it in between is displaced again.
+pub(crate) fn place_constants(context: &ID3D11DeviceContext, wanted: Option<(u32, [f32; 4])>) {
     let mut constants = VERTEX_CONSTANTS.lock().unwrap();
-    let constants = constants.as_mut().unwrap();
+    let Some(constants) = constants.as_mut() else {
+        return;
+    };
+    if let Some((at, _)) = constants.placed
+        && wanted.is_none_or(|(slot, _)| slot != at)
+    {
+        let (at, displaced) = constants.placed.take().unwrap();
+        if vertex_constants_at(context, at).as_ref() == Some(&constants.buffer) {
+            unsafe { context.VSSetConstantBuffers(at, Some(&[displaced])) };
+        }
+    }
+    let Some((slot, data)) = wanted else {
+        CONSTANTS_PLACED.store(false, Ordering::Relaxed);
+        return;
+    };
+    let bits = data.map(f32::to_bits);
     if constants.sent != bits {
         unsafe {
             context.UpdateSubresource(&constants.buffer, 0, None, data.as_ptr().cast(), 0, 0);
         };
         constants.sent = bits;
     }
-    let mut previous: [Option<ID3D11Buffer>; 1] = [None];
-    unsafe {
-        context.VSGetConstantBuffers(slot, Some(&mut previous));
-        context.VSSetConstantBuffers(slot, Some(&[Some(constants.buffer.clone())]));
+    let current = vertex_constants_at(context, slot);
+    if current.as_ref() != Some(&constants.buffer) {
+        unsafe { context.VSSetConstantBuffers(slot, Some(&[Some(constants.buffer.clone())])) };
+        constants.placed = Some((slot, current));
     }
-    draw();
-    unsafe { context.VSSetConstantBuffers(slot, Some(&previous)) };
+    CONSTANTS_PLACED.store(true, Ordering::Relaxed);
 }
 
 macro_rules! immediate_only {
@@ -562,6 +626,40 @@ macro_rules! immediate_only {
             return;
         }
     };
+}
+
+/// The engine's buffers, with the one the private constants displaced in place of theirs.
+unsafe extern "system" fn get_vertex_constants(
+    context: *mut c_void,
+    start: u32,
+    count: u32,
+    buffers: *mut *mut c_void,
+) {
+    immediate_only!(GET_VERTEX_CONSTANTS, context, start, count, buffers);
+    unsafe { original(&GET_VERTEX_CONSTANTS)(context, start, count, buffers) };
+    if buffers.is_null() || !CONSTANTS_PLACED.load(Ordering::Relaxed) {
+        return;
+    }
+    let constants = VERTEX_CONSTANTS.lock().unwrap();
+    let Some(VertexConstants {
+        buffer,
+        placed: Some((slot, displaced)),
+        ..
+    }) = constants.as_ref()
+    else {
+        return;
+    };
+    if !(start..start.saturating_add(count)).contains(slot) {
+        return;
+    }
+    let entry = unsafe { buffers.add((slot - start) as usize) };
+    if unsafe { *entry } == buffer.as_raw() {
+        drop(unsafe { ID3D11Buffer::from_raw(*entry) });
+        let substitute = displaced
+            .clone()
+            .map_or(core::ptr::null_mut(), Interface::into_raw);
+        unsafe { *entry = substitute };
+    }
 }
 
 pub(crate) fn release_push_scale() {
@@ -686,6 +784,7 @@ unsafe extern "system" fn set_depth_state(
     WRITES.store(writes, Ordering::Relaxed);
     unsafe { original(&SET_DEPTH_STATE)(context, depth_state(state), stencil_ref) };
     if changed && BOUND.load(Ordering::Relaxed) {
+        resend(context, VERTEX | DOMAIN | PIXEL);
         unsafe {
             original(&SET_RASTER)(
                 context,
@@ -778,14 +877,14 @@ unsafe extern "system" fn set_vertex_shader(
     immediate_only!(SET_VERTEX_SHADER, context, shader, instances, count);
     *LAST_VERTEX_SHADER.lock().unwrap() =
         unsafe { ID3D11VertexShader::from_raw_borrowed(&shader) }.cloned();
-    VERTEX_INSTANCES.store(count, Ordering::Relaxed);
-    let sent = if count == 0 && DRAWING.load(Ordering::Relaxed) {
-        vertex_shader(shader)
-    } else {
-        VERTEX_CONSTANT_SLOT.store(u32::MAX, Ordering::Relaxed);
-        shader
-    };
-    unsafe { original(&SET_VERTEX_SHADER)(context, sent, instances, count) };
+    VERTEX_CONSTANT_SLOT.store(u32::MAX, Ordering::Relaxed);
+    set_stage(
+        context,
+        &SET_VERTEX_SHADER,
+        VERTEX,
+        shader,
+        (instances, count, &VERTEX_INSTANCES),
+    );
 }
 
 fn domain_shader(shader: *mut c_void) -> *mut c_void {
@@ -805,13 +904,17 @@ unsafe extern "system" fn set_domain_shader(
     immediate_only!(SET_DOMAIN_SHADER, context, shader, instances, count);
     *LAST_DOMAIN_SHADER.lock().unwrap() =
         unsafe { ID3D11DomainShader::from_raw_borrowed(&shader) }.cloned();
-    DOMAIN_INSTANCES.store(count, Ordering::Relaxed);
-    let sent = if count == 0 && DRAWING.load(Ordering::Relaxed) {
-        domain_shader(shader)
-    } else {
-        shader
-    };
-    unsafe { original(&SET_DOMAIN_SHADER)(context, sent, instances, count) };
+    set_stage(
+        context,
+        &SET_DOMAIN_SHADER,
+        DOMAIN,
+        shader,
+        (instances, count, &DOMAIN_INSTANCES),
+    );
+    // the vertex stage's twin depends on whether a domain shader is bound
+    if mirrored() {
+        resend(context, VERTEX);
+    }
 }
 
 fn pixel_shader(shader: *mut c_void) -> *mut c_void {
@@ -831,13 +934,13 @@ unsafe extern "system" fn set_pixel_shader(
     immediate_only!(SET_PIXEL_SHADER, context, shader, instances, count);
     *LAST_PIXEL_SHADER.lock().unwrap() =
         unsafe { ID3D11PixelShader::from_raw_borrowed(&shader) }.cloned();
-    PIXEL_INSTANCES.store(count, Ordering::Relaxed);
-    let sent = if count == 0 && DRAWING.load(Ordering::Relaxed) {
-        pixel_shader(shader)
-    } else {
-        shader
-    };
-    unsafe { original(&SET_PIXEL_SHADER)(context, sent, instances, count) };
+    set_stage(
+        context,
+        &SET_PIXEL_SHADER,
+        PIXEL,
+        shader,
+        (instances, count, &PIXEL_INSTANCES),
+    );
 }
 
 macro_rules! shader_getter {
@@ -850,7 +953,7 @@ macro_rules! shader_getter {
         ) {
             immediate_only!($hook, context, shader, instances, count);
             unsafe { original(&$hook)(context, shader, instances, count) };
-            if DRAWING.load(Ordering::Relaxed) && !shader.is_null() {
+            if !shader.is_null() {
                 let logical = $last.lock().unwrap().clone();
                 if !unsafe { *shader }.is_null() {
                     drop(unsafe { <$shader>::from_raw(*shader) });
@@ -902,15 +1005,20 @@ pub(crate) fn test_shader_readback(
         context.PSSetShader(&pixel, None);
         context.OMSetRenderTargets(None, depth);
     }
+    // the engine's shaders read back while their twins stay bound across draws, also after a
+    // state save and restore, and the engine's own bound again once the world view is unbound
     macro_rules! check {
-        ($get:ident, $set:ident, $hook:ident, $expected:ident, $shader:ty) => {
+        ($get:ident, $set:ident, $hook:ident, $expected:ident, $shader:ty, $twinned:expr) => {
             let mut restored = None;
             unsafe { context.$get(&raw mut restored, None, None) };
             assert_eq!(
                 restored.as_ref().map(Interface::as_raw),
                 Some($expected.as_raw())
             );
-            unsafe { context.$set(restored.as_ref(), None) };
+            unsafe {
+                context.$set(restored.as_ref(), None);
+                context.Draw(3, 0);
+            }
             let mut native = core::ptr::null_mut();
             unsafe {
                 original(&$hook)(
@@ -921,55 +1029,31 @@ pub(crate) fn test_shader_readback(
                 )
             };
             let native = unsafe { <$shader>::from_raw(native) };
-            assert_ne!(native.as_raw(), $expected.as_raw());
+            assert_eq!(native.as_raw() != $expected.as_raw(), $twinned);
         };
     }
-    with_shaders(context.as_raw(), || {
-        with_shaders(context.as_raw(), || {
-            check!(
-                VSGetShader,
-                VSSetShader,
-                GET_VERTEX_SHADER,
-                vertex,
-                ID3D11VertexShader
-            );
-            check!(
-                PSGetShader,
-                PSSetShader,
-                GET_PIXEL_SHADER,
-                pixel,
-                ID3D11PixelShader
-            );
-        });
+    for twinned in [true, true, false] {
+        if !twinned {
+            unsafe { context.OMSetRenderTargets(None, None) };
+        }
+        unsafe { context.Draw(3, 0) };
         check!(
             VSGetShader,
             VSSetShader,
             GET_VERTEX_SHADER,
             vertex,
-            ID3D11VertexShader
+            ID3D11VertexShader,
+            twinned
         );
         check!(
             PSGetShader,
             PSSetShader,
             GET_PIXEL_SHADER,
             pixel,
-            ID3D11PixelShader
+            ID3D11PixelShader,
+            twinned
         );
-    });
-    let mut restored_vertex = None;
-    let mut restored_pixel = None;
-    unsafe {
-        context.VSGetShader(&raw mut restored_vertex, None, None);
-        context.PSGetShader(&raw mut restored_pixel, None, None);
     }
-    assert_eq!(
-        restored_vertex.as_ref().map(Interface::as_raw),
-        Some(vertex.as_raw())
-    );
-    assert_eq!(
-        restored_pixel.as_ref().map(Interface::as_raw),
-        Some(pixel.as_raw())
-    );
     unsafe { context.ClearState() };
 }
 
@@ -1136,11 +1220,16 @@ unsafe extern "system" fn clear_state(context: *mut c_void) {
     LAST_RASTER.store(0, Ordering::Relaxed);
     LAST_VIEWPORTS.lock().unwrap().clear();
     VERTEX_CONSTANT_SLOT.store(u32::MAX, Ordering::Relaxed);
+    if let Some(constants) = VERTEX_CONSTANTS.lock().unwrap().as_mut() {
+        constants.placed = None;
+    }
+    CONSTANTS_PLACED.store(false, Ordering::Relaxed);
     WRITES.store(true, Ordering::Relaxed);
     DEPTH_TESTS.store(true, Ordering::Relaxed);
     VERTEX_INSTANCES.store(0, Ordering::Relaxed);
     PIXEL_INSTANCES.store(0, Ordering::Relaxed);
     DOMAIN_INSTANCES.store(0, Ordering::Relaxed);
+    MARKED.store(0, Ordering::Relaxed);
     if let Some(view) = previous
         && let Ok(resource) = unsafe { view.GetResource() }
     {
@@ -1151,29 +1240,34 @@ unsafe extern "system" fn clear_state(context: *mut c_void) {
     }
 }
 
-fn drawn() {
+/// Marks the bound target as drawn into, once per bind and per copy refresh, and binds the
+/// constants the draw's twin needs.
+fn drawn(context: *mut c_void) {
     let resource = BOUND_RESOURCE.load(Ordering::Relaxed) as *mut c_void;
+    let generation = crate::copy::count() + 1;
     if WRITES.load(Ordering::Relaxed)
+        && MARKED.swap(generation, Ordering::Relaxed) != generation
         && let Some(resource) = unsafe { ID3D11Resource::from_raw_borrowed(&resource) }
     {
         crate::copy::mark(resource, BOUND.load(Ordering::Relaxed));
     }
+    with_vertex_constants(context);
 }
 
 unsafe extern "system" fn draw(context: *mut c_void, vertices: u32, start: u32) {
     immediate_only!(DRAW, context, vertices, start);
-    drawn();
-    with_shaders(context, || unsafe {
+    drawn(context);
+    unsafe {
         original(&DRAW)(context, vertices, start);
-    });
+    };
 }
 
 unsafe extern "system" fn draw_indexed(context: *mut c_void, indices: u32, start: u32, base: i32) {
     immediate_only!(DRAW_INDEXED, context, indices, start, base);
-    drawn();
-    with_shaders(context, || unsafe {
+    drawn(context);
+    unsafe {
         original(&DRAW_INDEXED)(context, indices, start, base);
-    });
+    };
 }
 
 unsafe extern "system" fn draw_instanced(
@@ -1184,10 +1278,10 @@ unsafe extern "system" fn draw_instanced(
     first: u32,
 ) {
     immediate_only!(DRAW_INSTANCED, context, vertices, instances, start, first);
-    drawn();
-    with_shaders(context, || unsafe {
+    drawn(context);
+    unsafe {
         original(&DRAW_INSTANCED)(context, vertices, instances, start, first);
-    });
+    };
 }
 
 unsafe extern "system" fn draw_indexed_instanced(
@@ -1207,18 +1301,18 @@ unsafe extern "system" fn draw_indexed_instanced(
         base,
         first
     );
-    drawn();
-    with_shaders(context, || unsafe {
+    drawn(context);
+    unsafe {
         original(&DRAW_INDEXED_INSTANCED)(context, indices, instances, start, base, first);
-    });
+    };
 }
 
 unsafe extern "system" fn draw_indirect(context: *mut c_void, arguments: *mut c_void, offset: u32) {
     immediate_only!(DRAW_INDIRECT, context, arguments, offset);
-    drawn();
-    with_shaders(context, || unsafe {
+    drawn(context);
+    unsafe {
         original(&DRAW_INDIRECT)(context, arguments, offset);
-    });
+    };
 }
 
 unsafe extern "system" fn draw_indexed_indirect(
@@ -1227,16 +1321,16 @@ unsafe extern "system" fn draw_indexed_indirect(
     offset: u32,
 ) {
     immediate_only!(DRAW_INDEXED_INDIRECT, context, arguments, offset);
-    drawn();
-    with_shaders(context, || unsafe {
+    drawn(context);
+    unsafe {
         original(&DRAW_INDEXED_INDIRECT)(context, arguments, offset);
-    });
+    };
 }
 
 unsafe extern "system" fn draw_auto(context: *mut c_void) {
     immediate_only!(DRAW_AUTO, context);
-    drawn();
-    with_shaders(context, || unsafe { original(&DRAW_AUTO)(context) });
+    drawn(context);
+    unsafe { original(&DRAW_AUTO)(context) };
 }
 
 fn viewports(given: &[D3D11_VIEWPORT]) -> Vec<D3D11_VIEWPORT> {
@@ -1391,4 +1485,164 @@ pub(crate) fn counters() -> String {
         CLEARS.load(Ordering::Relaxed),
         crate::copy::counters()
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::twin::tests::{compile, compile_stage};
+    use windows::Win32::Graphics::Direct3D::{
+        D3D_DRIVER_TYPE_HARDWARE, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
+    };
+    use windows::Win32::Graphics::Direct3D11::*;
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32G8X24_TYPELESS, DXGI_SAMPLE_DESC};
+
+    /// CPU time per draw sent through the hooks with a world target bound, against the same draws
+    /// with no hooks. `cargo test --release -p reversed-z per_draw_cost -- --ignored --nocapture`
+    #[test]
+    #[ignore = "benchmark on the hardware device"]
+    #[allow(clippy::too_many_lines)]
+    fn per_draw_cost() {
+        crate::shader::install().unwrap();
+        let (mut device, mut context) = (None, None);
+        unsafe {
+            D3D11CreateDevice(
+                None,
+                D3D_DRIVER_TYPE_HARDWARE,
+                HMODULE::default(),
+                D3D11_CREATE_DEVICE_FLAG(0),
+                None,
+                D3D11_SDK_VERSION,
+                Some(&raw mut device),
+                None,
+                Some(&raw mut context),
+            )
+        }
+        .unwrap();
+        let (device, context) = (device.unwrap(), context.unwrap());
+        let vertex: Vec<ID3D11VertexShader> = [0.25, 0.5]
+            .map(|z| {
+                let code = compile(&format!(
+                    "float4 main(uint id : SV_VertexID) : SV_Position {{ return float4(0, 0, {z}, 1); }}"
+                ));
+                let mut shader = None;
+                unsafe { device.CreateVertexShader(&code, None, Some(&raw mut shader)) }.unwrap();
+                shader.unwrap()
+            })
+            .into();
+        let pixel: Vec<ID3D11PixelShader> = ["p.zzzz", "p.zzzz * 0.5"]
+            .map(|expression| {
+                let code = compile_stage(
+                    &format!(
+                        "float4 main(float4 p : SV_Position) : SV_Target {{ return {expression}; }}"
+                    ),
+                    s!("ps_5_0"),
+                );
+                let mut shader = None;
+                unsafe { device.CreatePixelShader(&code, None, Some(&raw mut shader)) }.unwrap();
+                shader.unwrap()
+            })
+            .into();
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: 64,
+            Height: 64,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_R32G8X24_TYPELESS,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: (D3D11_BIND_DEPTH_STENCIL.0 | D3D11_BIND_SHADER_RESOURCE.0).cast_unsigned(),
+            ..Default::default()
+        };
+        let mut depth = None;
+        unsafe { device.CreateTexture2D(&raw const desc, None, Some(&raw mut depth)) }.unwrap();
+        let depth = depth.unwrap();
+        let view_desc = D3D11_DEPTH_STENCIL_VIEW_DESC {
+            Format: DXGI_FORMAT_D32_FLOAT_S8X24_UINT,
+            ViewDimension: D3D11_DSV_DIMENSION_TEXTURE2D,
+            ..Default::default()
+        };
+        let mut view = None;
+        unsafe {
+            device.CreateDepthStencilView(&depth, Some(&raw const view_desc), Some(&raw mut view))
+        }
+        .unwrap();
+        let view = view.unwrap();
+        let state_desc = D3D11_DEPTH_STENCIL_DESC {
+            DepthEnable: true.into(),
+            DepthWriteMask: D3D11_DEPTH_WRITE_MASK_ALL,
+            DepthFunc: D3D11_COMPARISON_LESS,
+            ..Default::default()
+        };
+        let mut state = None;
+        unsafe { device.CreateDepthStencilState(&raw const state_desc, Some(&raw mut state)) }
+            .unwrap();
+        let viewport = D3D11_VIEWPORT {
+            Width: 64.0,
+            Height: 64.0,
+            MaxDepth: 1.0,
+            ..Default::default()
+        };
+
+        // the fastest of several short runs, so other work on the machine and the GPU drops out
+        let best = |draw: &dyn Fn(u32)| {
+            const DRAWS: u32 = 20_000;
+            (0..9)
+                .map(|_| {
+                    unsafe { context.Flush() };
+                    let start = std::time::Instant::now();
+                    for i in 0..DRAWS {
+                        draw(i);
+                    }
+                    start.elapsed().as_nanos() / u128::from(DRAWS)
+                })
+                .min()
+                .unwrap()
+        };
+        let run = |label: &str| {
+            unsafe {
+                context.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                context.OMSetDepthStencilState(state.as_ref(), 0);
+                context.RSSetViewports(Some(&[viewport]));
+                context.OMSetRenderTargets(None, &view);
+                context.VSSetShader(&vertex[0], None);
+                context.PSSetShader(&pixel[0], None);
+            }
+            let same = best(&|_| unsafe { context.Draw(3, 0) });
+            let changing = best(&|i| unsafe {
+                context.VSSetShader(&vertex[(i & 1) as usize], None);
+                context.PSSetShader(&pixel[(i & 1) as usize], None);
+                context.Draw(3, 0);
+            });
+            println!("{label}: {same} ns per draw, {changing} with shaders changing every draw");
+            unsafe { context.ClearState() };
+        };
+        run("warm-up");
+        crate::copy::initialize(&device).unwrap();
+        create_vertex_constants(&device).unwrap();
+        for _ in 0..2 {
+            run("no hooks");
+            install_test_hooks(&context);
+            crate::copy::mark(&depth.cast().unwrap(), true);
+            run("hooks, world bound");
+            unsafe {
+                context.OMSetRenderTargets(None, &view);
+                context.VSSetShader(&vertex[0], None);
+            }
+            let plain = best(&|_| unsafe { context.Draw(3, 0) });
+            let constants = best(&|_| {
+                place_constants(&context, Some((13, [1.0, 2.0, 3.0, 4.0])));
+                unsafe { context.Draw(3, 0) };
+            });
+            place_constants(&context, None);
+            println!("hooks, private constants: {constants} ns per draw against {plain}");
+            unsafe { context.ClearState() };
+            remove();
+        }
+        crate::copy::release();
+        crate::shader::remove();
+    }
 }

@@ -579,12 +579,12 @@ mod tests {
             context.GSSetShader(gs.as_ref(), None);
             context.SOSetTargets(1, Some([Some(output.clone())].as_ptr()), Some(&0));
             if let Some(slot) = constants {
-                crate::context::draw_with_constants(
+                crate::context::place_constants(
                     context,
-                    slot,
-                    [scale, a - 1.0, -b, orthographic],
-                    || context.Draw(1, 0),
+                    Some((slot, [scale, a - 1.0, -b, orthographic])),
                 );
+                context.Draw(1, 0);
+                crate::context::place_constants(context, None);
                 let mut restored = [None];
                 context.VSGetConstantBuffers(slot, Some(&mut restored));
                 assert_eq!(
