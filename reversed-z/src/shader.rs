@@ -6,6 +6,7 @@
 
 use core::ffi::c_void;
 use std::cell::Cell;
+use std::collections::BTreeSet;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -74,6 +75,7 @@ static FAILURES: AtomicU64 = AtomicU64::new(0);
 static MISSED: AtomicU64 = AtomicU64::new(0);
 static PIXEL_MADE: AtomicU64 = AtomicU64::new(0);
 static PIXEL_FAILURES: AtomicU64 = AtomicU64::new(0);
+static REPORTED: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
 thread_local! { static BUILDING: Cell<bool> = const { Cell::new(false) }; }
 
 fn install_hook<F: Copy>(
@@ -279,7 +281,7 @@ pub(crate) fn mirrored(
         fallback,
         |code| crate::twin::mirrored(code).map(crate::twin::Pixel::Mirrored),
         |device| device.vtable().CreateVertexShader,
-        true,
+        "vertex",
     )
 }
 
@@ -289,7 +291,7 @@ pub(crate) fn domain(shader: &ID3D11DomainShader) -> Option<ID3D11DomainShader> 
         || None,
         |code| crate::twin::mirrored_domain(code).map(crate::twin::Pixel::Mirrored),
         |device| device.vtable().CreateDomainShader,
-        true,
+        "domain",
     )
     .map(|(shader, _)| shader)
 }
@@ -300,7 +302,7 @@ pub(crate) fn pixel(shader: &ID3D11PixelShader) -> Option<ID3D11PixelShader> {
         || None,
         crate::twin::pixel,
         |device| device.vtable().CreatePixelShader,
-        false,
+        "pixel",
     )
     .map(|(shader, _)| shader)
 }
@@ -310,8 +312,9 @@ fn mirror<S: Interface + core::ops::Deref<Target = ID3D11DeviceChild>>(
     fallback: impl FnOnce() -> Option<Vec<u8>>,
     rewrite: impl FnOnce(&[u8]) -> Option<crate::twin::Pixel>,
     create: impl FnOnce(&ID3D11Device) -> CreateVertexFn,
-    vertex: bool,
+    stage: &'static str,
 ) -> Option<(S, Option<u32>)> {
+    let vertex = stage != "pixel";
     let mut slot = NO_CONSTANTS;
     let mut size = 4;
     if unsafe { shader.GetPrivateData(&CONSTANTS, &raw mut size, Some((&raw mut slot).cast())) }
@@ -336,26 +339,20 @@ fn mirror<S: Interface + core::ops::Deref<Target = ID3D11DeviceChild>>(
         ));
     }
     let Some(code) = bytecode(shader).or_else(fallback) else {
-        if MISSED.fetch_add(1, Ordering::Relaxed) == 0 {
-            crate::log(if vertex {
-                "world vertex shader bytecode unavailable; shaders created before capture may not be reversed"
-            } else {
-                "world pixel shader bytecode unavailable; shaders created before capture may not be reversed"
-            });
+        MISSED.fetch_add(1, Ordering::Relaxed);
+        if first_report(format!("{stage}-{:p}", shader.as_raw())) {
+            crate::log(&format!(
+                "world {stage} shader {:p} draws unreversed: no bytecode captured (created before capture)",
+                shader.as_raw()
+            ));
         }
         return None;
     };
     let Some(rewritten) = rewrite(&code) else {
         slot = FAILED;
         let _ = unsafe { shader.SetPrivateData(&CONSTANTS, 4, Some((&raw const slot).cast())) };
-        let failures = if vertex { &FAILURES } else { &PIXEL_FAILURES };
-        if failures.fetch_add(1, Ordering::Relaxed) == 0 {
-            crate::log(if vertex {
-                "world vertex shader rewrite refused"
-            } else {
-                "world pixel shader rewrite refused"
-            });
-        }
+        (if vertex { &FAILURES } else { &PIXEL_FAILURES }).fetch_add(1, Ordering::Relaxed);
+        untwinned(stage, "rewrite refused", &code);
         return None;
     };
     let crate::twin::Pixel::Mirrored(rewritten) = rewritten else {
@@ -400,16 +397,49 @@ fn mirror<S: Interface + core::ops::Deref<Target = ID3D11DeviceChild>>(
         if slot != NO_CONSTANTS {
             PRECISE.fetch_add(1, Ordering::Relaxed);
         }
-    } else if (if vertex { &FAILURES } else { &PIXEL_FAILURES }).fetch_add(1, Ordering::Relaxed)
-        == 0
-    {
-        crate::log(if vertex {
-            "world vertex shader creation failed after rewriting"
-        } else {
-            "world pixel shader creation failed after rewriting"
-        });
+    } else {
+        (if vertex { &FAILURES } else { &PIXEL_FAILURES }).fetch_add(1, Ordering::Relaxed);
+        untwinned(stage, "twin creation failed", &code);
     }
     made
+}
+
+fn first_report(key: String) -> bool {
+    REPORTED.lock().unwrap().insert(key)
+}
+
+/// Logs a world shader that draws without a twin, once per stage and DXBC checksum, and saves its
+/// bytecode beside the log as `reversed-z-shaders\<stage>-<checksum>.dxbc`.
+fn untwinned(stage: &str, reason: &str, code: &[u8]) {
+    let checksum: String = match code.get(4..20) {
+        Some(sum) if code.starts_with(b"DXBC") => {
+            format!("{:032x}", u128::from_be_bytes(sum.try_into().unwrap()))
+        }
+        _ => format!("len{}", code.len()),
+    };
+    let name = format!("{stage}-{checksum}");
+    if !first_report(name.clone()) {
+        return;
+    }
+    let saved = match save(&name, code) {
+        Ok(path) => format!("saved to {}", path.display()),
+        Err(e) => format!("not saved: {e}"),
+    };
+    crate::log(&format!(
+        "world {stage} shader {checksum} ({} bytes) draws unreversed: {reason}; {saved}",
+        code.len()
+    ));
+}
+
+fn save(name: &str, code: &[u8]) -> std::io::Result<std::path::PathBuf> {
+    let host = crate::HOST
+        .get()
+        .ok_or_else(|| std::io::Error::other("no host"))?;
+    let dir = skse::log::dir(host.skse().runtime_version)?.join("reversed-z-shaders");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{name}.dxbc"));
+    std::fs::write(&path, code)?;
+    Ok(path)
 }
 
 pub(crate) fn counters() -> String {
