@@ -33,7 +33,7 @@ use windows::Win32::Graphics::Direct3D11::{
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
 use windows::Win32::System::LibraryLoader::GetProcAddress;
-use windows::core::{HRESULT, Interface, s};
+use windows::core::{HRESULT, IUnknown, Interface, s};
 
 type SetTargetsFn = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void, *mut c_void);
 type SetTargetsUavFn = unsafe extern "system" fn(
@@ -54,6 +54,9 @@ type SetShaderFn = unsafe extern "system" fn(*mut c_void, *mut c_void, *const *m
 type GetShaderFn =
     unsafe extern "system" fn(*mut c_void, *mut *mut c_void, *mut *mut c_void, *mut u32);
 type GetConstantsFn = unsafe extern "system" fn(*mut c_void, u32, u32, *mut *mut c_void);
+type GetRasterFn = unsafe extern "system" fn(*mut c_void, *mut *mut c_void);
+type GetDepthStateFn = unsafe extern "system" fn(*mut c_void, *mut *mut c_void, *mut u32);
+type GetViewportsFn = unsafe extern "system" fn(*mut c_void, *mut u32, *mut D3D11_VIEWPORT);
 type CopyFn = unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void);
 type CopyRegionFn = unsafe extern "system" fn(
     *mut c_void,
@@ -141,6 +144,9 @@ hooks! {
     SET_DEPTH_STATE: SetDepthStateFn = OMSetDepthStencilState => set_depth_state,
     SET_RASTER: SetRasterFn = RSSetState => set_raster,
     SET_VIEWPORTS: SetViewportsFn = RSSetViewports => set_viewports,
+    GET_DEPTH_STATE: GetDepthStateFn = OMGetDepthStencilState => get_depth_state,
+    GET_RASTER: GetRasterFn = RSGetState => get_raster,
+    GET_VIEWPORTS: GetViewportsFn = RSGetViewports => get_viewports,
     CLEAR_DEPTH: ClearDepthFn = ClearDepthStencilView => clear_depth,
     SET_VERTEX_SHADER: SetShaderFn = VSSetShader => set_vertex_shader,
     SET_PIXEL_SHADER: SetShaderFn = PSSetShader => set_pixel_shader,
@@ -982,6 +988,73 @@ shader_getter!(
     ID3D11DomainShader
 );
 
+/// Hands a state getter's caller the state it set when the bound one is that state's twin, so a
+/// caller that compares or restores what it read sees its own state.
+fn logical_state(
+    cache: &Mutex<Option<HashMap<usize, usize>>>,
+    last: &AtomicUsize,
+    out: *mut *mut c_void,
+) {
+    if out.is_null() {
+        return;
+    }
+    let bound = unsafe { *out };
+    let logical = last.load(Ordering::Relaxed);
+    let sent = cache
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|c| c.get(&logical).copied());
+    if bound.is_null() || bound as usize == logical || sent != Some(bound as usize) {
+        return;
+    }
+    let logical = logical as *mut c_void;
+    unsafe {
+        drop(IUnknown::from_raw(bound));
+        *out = IUnknown::from_raw_borrowed(&logical)
+            .unwrap()
+            .clone()
+            .into_raw();
+    }
+}
+
+unsafe extern "system" fn get_depth_state(
+    context: *mut c_void,
+    state: *mut *mut c_void,
+    stencil_ref: *mut u32,
+) {
+    immediate_only!(GET_DEPTH_STATE, context, state, stencil_ref);
+    unsafe { original(&GET_DEPTH_STATE)(context, state, stencil_ref) };
+    logical_state(&MIRRORED_DEPTH, &LAST_DEPTH_STATE, state);
+}
+
+unsafe extern "system" fn get_raster(context: *mut c_void, state: *mut *mut c_void) {
+    immediate_only!(GET_RASTER, context, state);
+    unsafe { original(&GET_RASTER)(context, state) };
+    logical_state(&MIRRORED_RASTER, &LAST_RASTER, state);
+}
+
+unsafe extern "system" fn get_viewports(
+    context: *mut c_void,
+    count: *mut u32,
+    list: *mut D3D11_VIEWPORT,
+) {
+    immediate_only!(GET_VIEWPORTS, context, count, list);
+    let capacity = if count.is_null() { 0 } else { unsafe { *count } };
+    unsafe { original(&GET_VIEWPORTS)(context, count, list) };
+    if count.is_null() || list.is_null() {
+        return;
+    }
+    let filled = unsafe { *count }.min(capacity) as usize;
+    let given = unsafe { core::slice::from_raw_parts_mut(list, filled) };
+    let stored = LAST_VIEWPORTS.lock().unwrap();
+    if let Some(stored) = stored.get(..filled)
+        && viewports(stored) == given
+    {
+        given.copy_from_slice(stored);
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn test_shader_readback(
     device: &ID3D11Device,
@@ -1049,6 +1122,91 @@ pub(crate) fn test_shader_readback(
             ID3D11PixelShader,
             twinned
         );
+    }
+    unsafe { context.ClearState() };
+}
+
+#[cfg(test)]
+pub(crate) fn test_state_readback(
+    device: &ID3D11Device,
+    context: &ID3D11DeviceContext,
+    depth: &ID3D11DepthStencilView,
+) {
+    let mut depth_state = None;
+    let desc = D3D11_DEPTH_STENCIL_DESC {
+        DepthEnable: true.into(),
+        DepthWriteMask: D3D11_DEPTH_WRITE_MASK_ALL,
+        DepthFunc: D3D11_COMPARISON_LESS,
+        ..Default::default()
+    };
+    unsafe { device.CreateDepthStencilState(&raw const desc, Some(&raw mut depth_state)) }.unwrap();
+    let depth_state = depth_state.unwrap();
+    let mut raster_state = None;
+    let desc = D3D11_RASTERIZER_DESC {
+        FillMode: windows::Win32::Graphics::Direct3D11::D3D11_FILL_SOLID,
+        CullMode: windows::Win32::Graphics::Direct3D11::D3D11_CULL_BACK,
+        DepthBias: 256,
+        ..Default::default()
+    };
+    unsafe { device.CreateRasterizerState(&raw const desc, Some(&raw mut raster_state)) }.unwrap();
+    let raster_state = raster_state.unwrap();
+    let viewport = D3D11_VIEWPORT {
+        Width: 13.0,
+        Height: 11.0,
+        MinDepth: 0.0,
+        MaxDepth: 0.75,
+        ..Default::default()
+    };
+    crate::copy::mark(&unsafe { depth.GetResource() }.unwrap(), true);
+    let native = || {
+        let (mut depth_state, mut stencil_ref, mut raster) =
+            (core::ptr::null_mut(), 0, core::ptr::null_mut());
+        let mut count = 1;
+        let mut viewport = D3D11_VIEWPORT::default();
+        unsafe {
+            original(&GET_DEPTH_STATE)(context.as_raw(), &raw mut depth_state, &raw mut stencil_ref);
+            original(&GET_RASTER)(context.as_raw(), &raw mut raster);
+            original(&GET_VIEWPORTS)(context.as_raw(), &raw mut count, &raw mut viewport);
+            drop(ID3D11DepthStencilState::from_raw(depth_state));
+            drop(ID3D11RasterizerState::from_raw(raster));
+        }
+        (depth_state, raster, viewport)
+    };
+    unsafe {
+        context.OMSetRenderTargets(None, depth);
+        context.OMSetDepthStencilState(&depth_state, 3);
+        context.RSSetState(&raster_state);
+        context.RSSetViewports(Some(&[viewport]));
+    }
+    let mirrored = native();
+    assert_ne!(mirrored.0, depth_state.as_raw());
+    assert_ne!(mirrored.1, raster_state.as_raw());
+    assert_eq!((mirrored.2.MinDepth, mirrored.2.MaxDepth), (0.25, 1.0));
+    for _ in 0..2 {
+        let (mut read_depth, mut read_ref) = (None, 0);
+        let mut count = 1;
+        let mut read_viewport = [D3D11_VIEWPORT::default()];
+        unsafe {
+            context.OMGetDepthStencilState(Some(&raw mut read_depth), Some(&raw mut read_ref));
+            context.RSGetViewports(&raw mut count, Some(read_viewport.as_mut_ptr()));
+        }
+        assert_eq!(
+            read_depth.as_ref().map(Interface::as_raw),
+            Some(depth_state.as_raw())
+        );
+        assert_eq!(read_ref, 3);
+        let read_raster = unsafe { context.RSGetState() }.ok();
+        assert_eq!(
+            read_raster.as_ref().map(Interface::as_raw),
+            Some(raster_state.as_raw())
+        );
+        assert_eq!(read_viewport[0], viewport);
+        unsafe {
+            context.OMSetDepthStencilState(read_depth.as_ref(), read_ref);
+            context.RSSetState(read_raster.as_ref());
+            context.RSSetViewports(Some(&read_viewport));
+        }
+        assert_eq!(native(), mirrored, "restoring what was read must not mirror it twice");
     }
     unsafe { context.ClearState() };
 }
