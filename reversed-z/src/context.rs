@@ -1012,9 +1012,7 @@ fn logical_state(
     unsafe {
         drop(IUnknown::from_raw(bound));
         *out = IUnknown::from_raw_borrowed(&logical)
-            .unwrap()
-            .clone()
-            .into_raw();
+            .map_or(core::ptr::null_mut(), |state| state.clone().into_raw());
     }
 }
 
@@ -1208,6 +1206,14 @@ pub(crate) fn test_state_readback(
         }
         assert_eq!(native(), mirrored, "restoring what was read must not mirror it twice");
     }
+    let (mut read_depth, mut read_ref) = (None, 0);
+    unsafe {
+        context.OMSetDepthStencilState(None, 0);
+        context.RSSetState(None);
+        context.OMGetDepthStencilState(Some(&raw mut read_depth), Some(&raw mut read_ref));
+    }
+    assert!(read_depth.is_none(), "a caller that set the default depth state reads none");
+    assert!(unsafe { context.RSGetState() }.is_err(), "a caller that set the default rasterizer reads none");
     unsafe { context.ClearState() };
 }
 
