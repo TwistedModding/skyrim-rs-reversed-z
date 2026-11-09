@@ -6,16 +6,18 @@
 
 use core::ffi::c_void;
 use std::cell::Cell;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::{D3D_SRV_DIMENSION_TEXTURE2D, ID3DBlob};
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_BIND_DEPTH_STENCIL, D3D11_BIND_SHADER_RESOURCE, D3D11_BIND_UNORDERED_ACCESS, D3D11_BOX,
-    D3D11_SHADER_MAX_INTERFACES, D3D11_SHADER_RESOURCE_VIEW_DESC,
-    D3D11_SHADER_RESOURCE_VIEW_DESC_0, D3D11_TEX2D_SRV, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
-    ID3D11ClassInstance, ID3D11ComputeShader, ID3D11Device, ID3D11DeviceContext, ID3D11Resource,
-    ID3D11ShaderResourceView, ID3D11Texture2D, ID3D11UnorderedAccessView,
+    D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT, D3D11_SHADER_MAX_INTERFACES,
+    D3D11_SHADER_RESOURCE_VIEW_DESC, D3D11_SHADER_RESOURCE_VIEW_DESC_0, D3D11_TEX2D_SRV,
+    D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, ID3D11ClassInstance, ID3D11ComputeShader,
+    ID3D11Device, ID3D11DeviceContext, ID3D11Resource, ID3D11ShaderResourceView, ID3D11Texture2D,
+    ID3D11UnorderedAccessView,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT_D24_UNORM_S8_UINT, DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_D32_FLOAT_S8X24_UINT,
@@ -49,6 +51,18 @@ struct Copy {
     height: u32,
 }
 
+const SLOTS: usize = D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT as usize;
+
+/// The copy views bound in each shader stage's resource slots, so a copy whose target is unbound
+/// or copied into is refreshed then only while a reader still has it bound; otherwise the reader
+/// that binds it next refreshes it.
+struct Bindings {
+    views: HashSet<usize>,
+    slots: [[usize; SLOTS]; 6],
+    bound: HashMap<usize, u32>,
+}
+
+static BINDINGS: Mutex<Option<Bindings>> = Mutex::new(None);
 static SHADER_OBJECT: Mutex<Option<ID3D11ComputeShader>> = Mutex::new(None);
 static STANDARD_SHADER_OBJECT: Mutex<Option<ID3D11ComputeShader>> = Mutex::new(None);
 static SEEDS: [AtomicUsize; 3] = [const { AtomicUsize::new(0) }; 3];
@@ -295,6 +309,16 @@ fn cached_copy(
     }
     let device = unsafe { texture.GetDevice() }.map_err(|e| e.to_string())?;
     let copy = create_copy(&device, &texture, input.as_raw())?;
+    BINDINGS
+        .lock()
+        .unwrap()
+        .get_or_insert_with(|| Bindings {
+            views: HashSet::new(),
+            slots: [[0; SLOTS]; 6],
+            bound: HashMap::new(),
+        })
+        .views
+        .insert(copy.view.as_raw() as usize);
     store_interface(resource, &VIEW, &copy.view)?;
     store_interface(resource, &TARGET, &copy.target)?;
     Ok(copy)
@@ -358,13 +382,66 @@ pub(crate) fn report(message: &str) {
     }
 }
 
+/// Refreshes `resource`'s stale copy while a reader can sample it without binding it again: one
+/// that kept it bound, or one past the context.
 pub(crate) fn run(context: &ID3D11DeviceContext, resource: &ID3D11Resource) {
-    if !COPYING.get()
-        && !matches!(state(resource), Some(CLEAN | STANDARD_CLEAN))
-        && private_interface::<ID3D11ShaderResourceView>(resource, &VIEW).is_some()
-        && let Err(error) = refresh(context, resource, None)
-    {
+    if COPYING.get() || matches!(state(resource), Some(CLEAN | STANDARD_CLEAN)) {
+        return;
+    }
+    let Some(view) = private_interface::<ID3D11ShaderResourceView>(resource, &VIEW) else {
+        return;
+    };
+    if !crate::vulkan::engaged() && !bound(view.as_raw() as usize) {
+        return;
+    }
+    if let Err(error) = refresh(context, resource, None) {
         report(&error);
+    }
+}
+
+fn bound(view: usize) -> bool {
+    BINDINGS
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|b| b.bound.contains_key(&view))
+}
+
+/// Records the views sent to `count` resource slots of `stage` from `start`; `None` unbinds them.
+pub(crate) fn bind_views(stage: usize, start: u32, count: u32, views: Option<&[*mut c_void]>) {
+    let mut bindings = BINDINGS.lock().unwrap();
+    let Some(b) = bindings.as_mut() else {
+        return;
+    };
+    for i in 0..count as usize {
+        let Some(slot) = b.slots[stage].get_mut(start as usize + i) else {
+            break;
+        };
+        let view = views.map_or(0, |v| v[i] as usize);
+        let copy = if b.views.contains(&view) { view } else { 0 };
+        if *slot == copy {
+            continue;
+        }
+        if *slot != 0
+            && let Some(n) = b.bound.get_mut(slot)
+        {
+            *n -= 1;
+            if *n == 0 {
+                b.bound.remove(slot);
+            }
+        }
+        if copy != 0 {
+            *b.bound.entry(copy).or_default() += 1;
+        }
+        *slot = copy;
+    }
+}
+
+/// Forgets every bound view after the context's state is cleared.
+pub(crate) fn unbind_views() {
+    if let Some(b) = BINDINGS.lock().unwrap().as_mut() {
+        b.slots = [[0; SLOTS]; 6];
+        b.bound.clear();
     }
 }
 
@@ -903,8 +980,47 @@ pub(crate) mod tests {
         partial_copy(device, context, depth_desc, &input);
         crate::context::test_shader_readback(device, context, &depth_view);
         crate::context::test_state_readback(device, context, &depth_view);
+        deferred_refresh(context, &depth.cast().unwrap(), &depth_view, &original);
         release();
         crate::context::remove();
+    }
+
+    /// A copy nobody reads is left stale when its target is unbound and refreshed by the reader
+    /// that binds it; one a reader still has bound is refreshed at the unbind.
+    fn deferred_refresh(
+        context: &ID3D11DeviceContext,
+        depth: &ID3D11Resource,
+        depth_view: &ID3D11DepthStencilView,
+        engine_view: &ID3D11ShaderResourceView,
+    ) {
+        let drawn_and_unbound = || unsafe {
+            context.OMSetRenderTargets(None, depth_view);
+            mark(depth, true);
+            context.OMSetRenderTargets(None, None);
+        };
+        mark(depth, true);
+        drawn_and_unbound();
+        assert_eq!(
+            state(depth),
+            Some(DIRTY),
+            "an unread copy waits for its reader"
+        );
+        unsafe { context.PSSetShaderResources(0, Some(&[Some(engine_view.clone())])) };
+        assert_eq!(
+            state(depth),
+            Some(CLEAN),
+            "the reader's bind refreshes the copy"
+        );
+        drawn_and_unbound();
+        assert_eq!(
+            state(depth),
+            Some(CLEAN),
+            "a copy still bound is refreshed at the unbind"
+        );
+        unsafe { context.PSSetShaderResources(0, Some(&[None])) };
+        drawn_and_unbound();
+        assert_eq!(state(depth), Some(DIRTY), "an unbound copy waits again");
+        unsafe { context.ClearState() };
     }
 
     fn partial_copy(

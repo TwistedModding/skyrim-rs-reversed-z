@@ -429,6 +429,12 @@ pub(crate) fn engage() -> Result<String, String> {
     ))
 }
 
+/// Community Shaders draws past the context, so its readers sample depth copies without binding them
+/// through the context.
+pub(crate) fn engaged() -> bool {
+    ENGAGED.load(Ordering::Acquire)
+}
+
 /// Maps the world depth textures to their DXVK images.
 pub(crate) fn sync_images() {
     let mut images = IMAGES.lock().unwrap();

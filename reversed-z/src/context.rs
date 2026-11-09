@@ -1173,7 +1173,7 @@ pub(crate) fn test_state_readback(
 }
 
 macro_rules! resource_hook {
-    ($name:ident, $slot:ident) => {
+    ($name:ident, $slot:ident, $stage:literal) => {
         unsafe extern "system" fn $name(
             context: *mut c_void,
             start: u32,
@@ -1182,6 +1182,14 @@ macro_rules! resource_hook {
         ) {
             immediate_only!($slot, context, start, count, views);
             let swapped = substituted(context, count, views);
+            let sent = swapped.as_ref().map_or(views, Vec::as_ptr);
+            crate::copy::bind_views(
+                $stage,
+                start,
+                count,
+                (!sent.is_null())
+                    .then(|| unsafe { core::slice::from_raw_parts(sent, count as usize) }),
+            );
             unsafe {
                 original(&$slot)(
                     context,
@@ -1193,12 +1201,12 @@ macro_rules! resource_hook {
         }
     };
 }
-resource_hook!(set_pixel_resources, SET_PIXEL_RESOURCES);
-resource_hook!(set_compute_resources, SET_COMPUTE_RESOURCES);
-resource_hook!(set_vertex_resources, SET_VERTEX_RESOURCES);
-resource_hook!(set_geometry_resources, SET_GEOMETRY_RESOURCES);
-resource_hook!(set_hull_resources, SET_HULL_RESOURCES);
-resource_hook!(set_domain_resources, SET_DOMAIN_RESOURCES);
+resource_hook!(set_pixel_resources, SET_PIXEL_RESOURCES, 0);
+resource_hook!(set_compute_resources, SET_COMPUTE_RESOURCES, 1);
+resource_hook!(set_vertex_resources, SET_VERTEX_RESOURCES, 2);
+resource_hook!(set_geometry_resources, SET_GEOMETRY_RESOURCES, 3);
+resource_hook!(set_hull_resources, SET_HULL_RESOURCES, 4);
+resource_hook!(set_domain_resources, SET_DOMAIN_RESOURCES, 5);
 
 /// Shader views with a reversed depth target's own view replaced by its copy's.
 fn substituted(
@@ -1325,6 +1333,7 @@ unsafe extern "system" fn clear_state(context: *mut c_void) {
     immediate_only!(CLEAR_STATE, context);
     let previous = LAST_DEPTH_VIEW.lock().unwrap().take();
     unsafe { original(&CLEAR_STATE)(context) };
+    crate::copy::unbind_views();
     BOUND.store(false, Ordering::Relaxed);
     BOUND_RESOURCE.store(0, Ordering::Relaxed);
     LAST_VERTEX_SHADER.lock().unwrap().take();
