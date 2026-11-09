@@ -52,6 +52,13 @@ struct Copy {
 }
 
 const SLOTS: usize = D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT as usize;
+/// Shader stages, as indices into the tracked resource slots.
+pub(crate) const PIXEL: usize = 0;
+pub(crate) const COMPUTE: usize = 1;
+pub(crate) const VERTEX: usize = 2;
+pub(crate) const GEOMETRY: usize = 3;
+pub(crate) const HULL: usize = 4;
+pub(crate) const DOMAIN: usize = 5;
 
 /// The copy views bound in each shader stage's resource slots, so a copy whose target is unbound
 /// or copied into is refreshed then only while a reader still has it bound; otherwise the reader
@@ -309,16 +316,6 @@ fn cached_copy(
     }
     let device = unsafe { texture.GetDevice() }.map_err(|e| e.to_string())?;
     let copy = create_copy(&device, &texture, input.as_raw())?;
-    BINDINGS
-        .lock()
-        .unwrap()
-        .get_or_insert_with(|| Bindings {
-            views: HashSet::new(),
-            slots: [[0; SLOTS]; 6],
-            bound: HashMap::new(),
-        })
-        .views
-        .insert(copy.view.as_raw() as usize);
     store_interface(resource, &VIEW, &copy.view)?;
     store_interface(resource, &TARGET, &copy.target)?;
     Ok(copy)
@@ -435,6 +432,25 @@ pub(crate) fn bind_views(stage: usize, start: u32, count: u32, views: Option<&[*
         }
         *slot = copy;
     }
+}
+
+/// The stages and slots that hold `view`.
+fn held(view: usize) -> Vec<(usize, u32)> {
+    let bindings = BINDINGS.lock().unwrap();
+    let Some(b) = bindings.as_ref().filter(|b| b.bound.contains_key(&view)) else {
+        return Vec::new();
+    };
+    b.slots
+        .iter()
+        .enumerate()
+        .flat_map(|(stage, slots)| {
+            slots
+                .iter()
+                .enumerate()
+                .filter(move |&(_, &bound)| bound == view)
+                .map(move |(slot, _)| (stage, u32::try_from(slot).unwrap()))
+        })
+        .collect()
 }
 
 /// Forgets every bound view after the context's state is cleared.
@@ -604,9 +620,20 @@ fn create_copy(
     let mut unordered = None;
     unsafe { device.CreateUnorderedAccessView(&standard, None, Some(&raw mut unordered)) }
         .map_err(|e| format!("copy target: {e}"))?;
+    let view = view.ok_or("copy view")?;
+    BINDINGS
+        .lock()
+        .unwrap()
+        .get_or_insert_with(|| Bindings {
+            views: HashSet::new(),
+            slots: [[0; SLOTS]; 6],
+            bound: HashMap::new(),
+        })
+        .views
+        .insert(view.as_raw() as usize);
     Ok(Copy {
         standard,
-        view: view.ok_or("copy view")?,
+        view,
         target: unordered.ok_or("copy target")?,
         engine_view: unsafe { ID3D11ShaderResourceView::from_raw_borrowed(&engine_view) }
             .cloned()
@@ -652,30 +679,37 @@ fn compile(invert: bool) -> Result<ID3DBlob, String> {
     code.ok_or_else(|| "compile: no code".into())
 }
 
-fn preserve_resources(context: &ID3D11DeviceContext, run: impl FnOnce()) {
-    macro_rules! preserve {
-        ($($name:ident: $get:ident => $set:ident),*) => {
-            $(
-                let mut $name: [Option<ID3D11ShaderResourceView>; 128] = core::array::from_fn(|_| None);
-                unsafe { context.$get(0, Some(&mut $name)) };
-            )*
-            run();
-            $(unsafe { context.$set(0, Some(&$name)) };)*
-        };
+/// Runs `run` and gives back the shader resource slots a copy disturbs: compute slot 0, which it
+/// binds to the source, and the slots holding `copy`, which binding the copy for writing empties.
+fn preserve_resources(
+    context: &ID3D11DeviceContext,
+    copy: &ID3D11ShaderResourceView,
+    run: impl FnOnce(),
+) {
+    let held = held(copy.as_raw() as usize);
+    let mut compute = [None];
+    unsafe { context.CSGetShaderResources(0, Some(&mut compute)) };
+    run();
+    unsafe { context.CSSetShaderResources(0, Some(&compute)) };
+    let views = [Some(copy.clone())];
+    for (stage, slot) in held {
+        let views = Some(&views[..]);
+        unsafe {
+            match stage {
+                PIXEL => context.PSSetShaderResources(slot, views),
+                COMPUTE => context.CSSetShaderResources(slot, views),
+                VERTEX => context.VSSetShaderResources(slot, views),
+                GEOMETRY => context.GSSetShaderResources(slot, views),
+                HULL => context.HSSetShaderResources(slot, views),
+                _ => context.DSSetShaderResources(slot, views),
+            }
+        }
     }
-    preserve!(
-        vertex: VSGetShaderResources => VSSetShaderResources,
-        hull: HSGetShaderResources => HSSetShaderResources,
-        domain: DSGetShaderResources => DSSetShaderResources,
-        geometry: GSGetShaderResources => GSSetShaderResources,
-        pixel: PSGetShaderResources => PSSetShaderResources,
-        compute: CSGetShaderResources => CSSetShaderResources
-    );
 }
 
 fn convert(context: &ID3D11DeviceContext, shader: &ID3D11ComputeShader, c: &Copy) {
     let _internal = Internal::enter();
-    preserve_resources(context, || {
+    preserve_resources(context, &c.view, || {
         crate::context::without_targets(context, || unsafe {
             let mut previous_shader = None;
             let mut instances: [Option<ID3D11ClassInstance>; D3D11_SHADER_MAX_INTERFACES as usize] =

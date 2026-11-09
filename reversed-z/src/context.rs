@@ -1173,7 +1173,7 @@ pub(crate) fn test_state_readback(
 }
 
 macro_rules! resource_hook {
-    ($name:ident, $slot:ident, $stage:literal) => {
+    ($name:ident, $slot:ident, $stage:ident) => {
         unsafe extern "system" fn $name(
             context: *mut c_void,
             start: u32,
@@ -1184,7 +1184,7 @@ macro_rules! resource_hook {
             let swapped = substituted(context, count, views);
             let sent = swapped.as_ref().map_or(views, Vec::as_ptr);
             crate::copy::bind_views(
-                $stage,
+                crate::copy::$stage,
                 start,
                 count,
                 (!sent.is_null())
@@ -1201,12 +1201,12 @@ macro_rules! resource_hook {
         }
     };
 }
-resource_hook!(set_pixel_resources, SET_PIXEL_RESOURCES, 0);
-resource_hook!(set_compute_resources, SET_COMPUTE_RESOURCES, 1);
-resource_hook!(set_vertex_resources, SET_VERTEX_RESOURCES, 2);
-resource_hook!(set_geometry_resources, SET_GEOMETRY_RESOURCES, 3);
-resource_hook!(set_hull_resources, SET_HULL_RESOURCES, 4);
-resource_hook!(set_domain_resources, SET_DOMAIN_RESOURCES, 5);
+resource_hook!(set_pixel_resources, SET_PIXEL_RESOURCES, PIXEL);
+resource_hook!(set_compute_resources, SET_COMPUTE_RESOURCES, COMPUTE);
+resource_hook!(set_vertex_resources, SET_VERTEX_RESOURCES, VERTEX);
+resource_hook!(set_geometry_resources, SET_GEOMETRY_RESOURCES, GEOMETRY);
+resource_hook!(set_hull_resources, SET_HULL_RESOURCES, HULL);
+resource_hook!(set_domain_resources, SET_DOMAIN_RESOURCES, DOMAIN);
 
 /// Shader views with a reversed depth target's own view replaced by its copy's.
 fn substituted(
@@ -1617,14 +1617,16 @@ mod tests {
     use crate::twin::tests::{compile, compile_stage};
     use windows::Win32::Foundation::HMODULE;
     use windows::Win32::Graphics::Direct3D::{
-        D3D_DRIVER_TYPE_HARDWARE, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
+        D3D_DRIVER_TYPE_HARDWARE, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, D3D_SRV_DIMENSION_TEXTURE2D,
     };
     use windows::Win32::Graphics::Direct3D11::*;
-    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32G8X24_TYPELESS, DXGI_SAMPLE_DESC};
+    use windows::Win32::Graphics::Dxgi::Common::{
+        DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS, DXGI_FORMAT_R32G8X24_TYPELESS, DXGI_SAMPLE_DESC,
+    };
     use windows::core::s;
 
     /// CPU time per draw sent through the hooks with a world target bound, against the same draws
-    /// with no hooks. `cargo test --release -p reversed-z per_draw_cost -- --ignored --nocapture`
+    /// with no hooks, and of a depth copy refreshed at a reader's bind. `cargo test --release -p reversed-z per_draw_cost -- --ignored --nocapture`
     #[test]
     #[ignore = "benchmark on the hardware device"]
     #[allow(clippy::too_many_lines)]
@@ -1697,6 +1699,26 @@ mod tests {
         }
         .unwrap();
         let view = view.unwrap();
+        let reader_desc = D3D11_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS,
+            ViewDimension: D3D_SRV_DIMENSION_TEXTURE2D,
+            Anonymous: D3D11_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D11_TEX2D_SRV {
+                    MostDetailedMip: 0,
+                    MipLevels: 1,
+                },
+            },
+        };
+        let mut reader = None;
+        unsafe {
+            device.CreateShaderResourceView(
+                &depth,
+                Some(&raw const reader_desc),
+                Some(&raw mut reader),
+            )
+        }
+        .unwrap();
+        let reader = reader.unwrap();
         let state_desc = D3D11_DEPTH_STENCIL_DESC {
             DepthEnable: true.into(),
             DepthWriteMask: D3D11_DEPTH_WRITE_MASK_ALL,
@@ -1765,6 +1787,16 @@ mod tests {
             });
             place_constants(&context, None);
             println!("hooks, private constants: {constants} ns per draw against {plain}");
+            let bound_copy = best(&|_| unsafe {
+                context.PSSetShaderResources(0, Some(&[Some(reader.clone())]));
+            });
+            let refreshed_copy = best(&|_| unsafe {
+                crate::copy::mark(&depth.cast().unwrap(), true);
+                context.PSSetShaderResources(0, Some(&[Some(reader.clone())]));
+            });
+            println!(
+                "hooks, depth copy refreshed at a reader's bind: {refreshed_copy} ns against {bound_copy} for the bind alone"
+            );
             unsafe { context.ClearState() };
             remove();
         }
