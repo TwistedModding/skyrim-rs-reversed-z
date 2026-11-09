@@ -96,6 +96,7 @@ dependencies = [
 name = "crash"
 version = "0.1.0"
 dependencies = [
+ "hook",
  "skse",
  "skyrim-sre",
  "versionlib",
