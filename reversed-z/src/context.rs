@@ -201,7 +201,7 @@ static WRITES: AtomicBool = AtomicBool::new(true);
 static BOUND_RESOURCE: AtomicUsize = AtomicUsize::new(0);
 /// Hashes the state caches' pointer keys with a single multiply.
 #[derive(Default)]
-struct PointerHasher(u64);
+pub(crate) struct PointerHasher(u64);
 
 impl Hasher for PointerHasher {
     fn finish(&self) -> u64 {
@@ -219,7 +219,7 @@ impl Hasher for PointerHasher {
     }
 }
 
-type PointerMap<V> = HashMap<usize, V, BuildHasherDefault<PointerHasher>>;
+pub(crate) type PointerMap<V> = HashMap<usize, V, BuildHasherDefault<PointerHasher>>;
 
 static MIRRORED_DEPTH: Mutex<Option<PointerMap<usize>>> = Mutex::new(None);
 static MIRRORED_RASTER: Mutex<Option<PointerMap<usize>>> = Mutex::new(None);

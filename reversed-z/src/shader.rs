@@ -20,7 +20,7 @@ use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, Lo
 use windows::Win32::System::SystemInformation::GetSystemDirectoryW;
 use windows::core::{GUID, HRESULT, Interface, PCWSTR, s, w};
 
-use crate::context::original;
+use crate::context::{PointerMap, original};
 
 type CreateDeviceFn = unsafe extern "system" fn(
     *mut c_void,
@@ -76,6 +76,18 @@ static MISSED: AtomicU64 = AtomicU64::new(0);
 static PIXEL_MADE: AtomicU64 = AtomicU64::new(0);
 static PIXEL_FAILURES: AtomicU64 = AtomicU64::new(0);
 thread_local! { static BUILDING: Cell<bool> = const { Cell::new(false) }; }
+
+/// A shader's settled twin (or none) and its constant slot, keyed by the shader's address. The
+/// entry holds the shader, so the address cannot be reused by another while it is cached.
+struct Resolved {
+    _shader: ID3D11DeviceChild,
+    twin: Option<usize>,
+    slot: Option<u32>,
+}
+
+static RESOLVED: Mutex<Option<PointerMap<Resolved>>> = Mutex::new(None);
+/// Cached shaders past this many are released and looked up again.
+const RESOLVED_LIMIT: usize = 1 << 14;
 
 fn install_hook<F: Copy>(
     slot: &Mutex<Option<hook::Hook<F>>>,
@@ -203,6 +215,7 @@ pub(crate) fn remove() {
         CREATE_PIXEL,
         CREATE_DOMAIN
     );
+    RESOLVED.lock().unwrap().take();
 }
 
 fn created(device: *mut *mut c_void, result: HRESULT) {
@@ -338,7 +351,44 @@ pub(crate) fn pixel(shader: &ID3D11PixelShader) -> Option<ID3D11PixelShader> {
     .map(|(shader, _)| shader)
 }
 
+/// The twin of `shader` and its constant slot, from the cache once the shader's outcome is settled.
 fn mirror<S: Interface + core::ops::Deref<Target = ID3D11DeviceChild>>(
+    shader: &S,
+    fallback: impl FnOnce() -> Option<Vec<u8>>,
+    rewrite: impl FnOnce(&[u8]) -> Option<crate::twin::Pixel>,
+    create: impl FnOnce(&ID3D11Device) -> CreateVertexFn,
+    vertex: bool,
+) -> Option<(S, Option<u32>)> {
+    let key = shader.as_raw() as usize;
+    if let Some(resolved) = RESOLVED.lock().unwrap().as_ref().and_then(|m| m.get(&key)) {
+        let twin = resolved.twin? as *mut c_void;
+        return Some((
+            unsafe { S::from_raw_borrowed(&twin) }?.clone(),
+            resolved.slot,
+        ));
+    }
+    let result = resolve(shader, fallback, rewrite, create, vertex);
+    let mut size = 0;
+    // a shader without its bytecode yet is looked up again, so its engine record can supply it
+    if unsafe { shader.GetPrivateData(&CONSTANTS, &raw mut size, None) }.is_ok() {
+        let mut resolved = RESOLVED.lock().unwrap();
+        let map = resolved.get_or_insert_with(PointerMap::default);
+        if map.len() >= RESOLVED_LIMIT {
+            map.clear();
+        }
+        map.insert(
+            key,
+            Resolved {
+                _shader: (**shader).clone(),
+                twin: result.as_ref().map(|(twin, _)| twin.as_raw() as usize),
+                slot: result.as_ref().and_then(|&(_, slot)| slot),
+            },
+        );
+    }
+    result
+}
+
+fn resolve<S: Interface + core::ops::Deref<Target = ID3D11DeviceChild>>(
     shader: &S,
     fallback: impl FnOnce() -> Option<Vec<u8>>,
     rewrite: impl FnOnce(&[u8]) -> Option<crate::twin::Pixel>,
@@ -688,12 +738,16 @@ mod tests {
         let original = original.unwrap();
         let (twin, slot) = mirrored(&original, || None).unwrap();
         assert_eq!(slot, None);
+        let cached = mirrored(&original, || panic!("settled shaders come from the cache")).unwrap();
+        assert_eq!(cached.0.as_raw(), twin.as_raw());
         // A shader predating interception must be retryable when its engine record becomes available.
-        unsafe { original.SetPrivateData(&BYTECODE, 0, None) }.unwrap();
-        unsafe { original.SetPrivateData(&CONSTANTS, 0, None) }.unwrap();
-        assert!(mirrored(&original, || None).is_none());
-        assert!(mirrored(&original, || Some(code)).is_some());
-        drop(twin);
+        let mut early = None;
+        unsafe { device.CreateVertexShader(&code, None, Some(&raw mut early)) }.unwrap();
+        let early = early.unwrap();
+        unsafe { early.SetPrivateData(&BYTECODE, 0, None) }.unwrap();
+        assert!(mirrored(&early, || None).is_none());
+        assert!(mirrored(&early, || Some(code)).is_some());
+        drop((twin, cached));
         unsafe { context.ClearState() };
         pixel_depth(&device, &context);
         unsafe { context.ClearState() };
