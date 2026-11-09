@@ -1875,6 +1875,13 @@ mod tests {
                 context.RSSetViewports(Some(&[viewport]));
             });
             println!("{label}: {state_sets} ns per depth state, raster state and viewport set");
+            let rebinds = best(&|_| unsafe { context.OMSetRenderTargets(None, &view) });
+            let switches = best(&|i| unsafe {
+                context.OMSetRenderTargets(None, (i & 1 == 0).then_some(&view));
+            });
+            println!(
+                "{label}: {rebinds} ns per bind of the same depth target, {switches} switching it on and off"
+            );
             unsafe { context.ClearState() };
         };
         run("warm-up");
