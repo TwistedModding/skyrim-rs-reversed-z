@@ -26,6 +26,8 @@ use windows::Win32::Graphics::Dxgi::Common::{
 };
 use windows::core::{GUID, Interface, s};
 
+use crate::context::PointerMap;
+
 pub(crate) const REVERSED_TARGETS: [usize; 3] = [
     sre::DepthStencilTargetId::scene as usize,
     sre::DepthStencilTargetId::second as usize,
@@ -68,6 +70,17 @@ struct Bindings {
     slots: [[usize; SLOTS]; 6],
     bound: Vec<(usize, u32)>,
 }
+
+/// A reader's view that resolved to a copy, held so its address cannot be reused while cached.
+struct HandedOut {
+    _view: ID3D11ShaderResourceView,
+    resource: ID3D11Resource,
+    copy: ID3D11ShaderResourceView,
+}
+
+static HANDED_OUT: Mutex<Option<PointerMap<HandedOut>>> = Mutex::new(None);
+/// Cached reader views past this many are released and resolved again.
+const HANDED_OUT_LIMIT: usize = 256;
 
 static BINDINGS: Mutex<Bindings> = Mutex::new(Bindings {
     views: Vec::new(),
@@ -484,6 +497,31 @@ pub(crate) fn stand_in(context: &ID3D11DeviceContext, view: *mut c_void) -> Opti
     ) {
         return None;
     }
+    depth_stand_in(context, view, input)
+}
+
+/// The copy for a reader's view in a depth format, refreshed when stale.
+#[inline(never)]
+fn depth_stand_in(
+    context: &ID3D11DeviceContext,
+    view: *mut c_void,
+    input: &ID3D11ShaderResourceView,
+) -> Option<*mut c_void> {
+    let known = HANDED_OUT
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|m| m.get(&(view as usize)))
+        .map(|h| (h.resource.clone(), h.copy.as_raw()));
+    if let Some((resource, copy)) = known {
+        if matches!(state(&resource), Some(CLEAN | STANDARD_CLEAN)) {
+            return Some(copy);
+        }
+        return refresh(context, &resource, Some(input))
+            .inspect_err(|error| report(error))
+            .ok()
+            .map(|copy| copy.as_raw());
+    }
     let resource = unsafe { input.GetResource() }.ok()?;
     if !reversed(&resource)
         && private_interface::<ID3D11ShaderResourceView>(&resource, &VIEW).is_none()
@@ -491,7 +529,23 @@ pub(crate) fn stand_in(context: &ID3D11DeviceContext, view: *mut c_void) -> Opti
         return None;
     }
     match refresh(context, &resource, Some(input)) {
-        Ok(copy) => Some(copy.as_raw()),
+        Ok(copy) => {
+            let raw = copy.as_raw();
+            let mut handed = HANDED_OUT.lock().unwrap();
+            let map = handed.get_or_insert_with(PointerMap::default);
+            if map.len() >= HANDED_OUT_LIMIT {
+                map.clear();
+            }
+            map.insert(
+                view as usize,
+                HandedOut {
+                    _view: input.clone(),
+                    resource,
+                    copy,
+                },
+            );
+            Some(raw)
+        }
         Err(error) => {
             report(&error);
             None
@@ -578,6 +632,7 @@ pub(crate) fn copied_region(
 }
 
 pub(crate) fn release() {
+    HANDED_OUT.lock().unwrap().take();
     SHADER_OBJECT.lock().unwrap().take();
     STANDARD_SHADER_OBJECT.lock().unwrap().take();
     for seed in &SEEDS {

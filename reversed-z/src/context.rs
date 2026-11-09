@@ -1244,15 +1244,13 @@ fn substituted(
     }
     let given = unsafe { core::slice::from_raw_parts(views, count as usize) };
     let context = unsafe { ID3D11DeviceContext::from_raw_borrowed(&context) }.unwrap();
-    given
-        .iter()
-        .any(|&v| crate::copy::stand_in(context, v).is_some())
-        .then(|| {
-            given
-                .iter()
-                .map(|&v| crate::copy::stand_in(context, v).unwrap_or(v))
-                .collect()
-        })
+    let mut swapped: Option<Vec<*mut c_void>> = None;
+    for (i, &view) in given.iter().enumerate() {
+        if let Some(copy) = crate::copy::stand_in(context, view) {
+            swapped.get_or_insert_with(|| given.to_vec())[i] = copy;
+        }
+    }
+    swapped
 }
 
 /// Binds a compute shader view as given.
