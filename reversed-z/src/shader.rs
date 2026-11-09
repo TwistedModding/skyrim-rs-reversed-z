@@ -10,9 +10,10 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use windows::Win32::Foundation::HMODULE;
-use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE, D3D_FEATURE_LEVEL};
+use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE, D3D_DRIVER_TYPE_WARP, D3D_FEATURE_LEVEL};
 use windows::Win32::Graphics::Direct3D11::{
-    ID3D11Device, ID3D11DeviceChild, ID3D11DomainShader, ID3D11PixelShader, ID3D11VertexShader,
+    D3D11_SDK_VERSION, ID3D11Device, ID3D11DeviceChild, ID3D11DeviceContext, ID3D11DomainShader,
+    ID3D11PixelShader, ID3D11VertexShader,
 };
 use windows::Win32::Graphics::Dxgi::DXGI_SWAP_CHAIN_DESC;
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
@@ -116,10 +117,42 @@ pub(crate) fn system_d3d11() -> Option<HMODULE> {
     unsafe { LoadLibraryW(PCWSTR(path.as_ptr())) }.ok()
 }
 
-/// Hooks device creation on DXVK's D3D11 when Community Shaders loaded it, else the system's, so
-/// bytecode is captured on the device every draw finally reaches.
+/// A WARP device of the system's D3D11 and its immediate context. Every device of that D3D11,
+/// hardware or not, shares their tables, so hooks taken from them sit below any wrapper's.
+pub(crate) fn system_device() -> Option<(ID3D11Device, ID3D11DeviceContext)> {
+    let create: CreateDeviceFn = unsafe {
+        core::mem::transmute(GetProcAddress(system_d3d11()?, s!("D3D11CreateDevice"))?)
+    };
+    let (mut device, mut context) = (core::ptr::null_mut(), core::ptr::null_mut());
+    unsafe {
+        create(
+            core::ptr::null_mut(),
+            D3D_DRIVER_TYPE_WARP,
+            HMODULE::default(),
+            0,
+            core::ptr::null(),
+            0,
+            D3D11_SDK_VERSION,
+            &raw mut device,
+            core::ptr::null_mut(),
+            &raw mut context,
+        )
+    }
+    .ok()
+    .ok()?;
+    let device = (!device.is_null()).then(|| unsafe { ID3D11Device::from_raw(device) });
+    let context = (!context.is_null()).then(|| unsafe { ID3D11DeviceContext::from_raw(context) });
+    Some((device?, context?))
+}
+
+/// Hooks shader creation where every draw finally lands: on the system's D3D11 below any wrapper
+/// (ENB, a proxy), whose device makes the shaders the context later binds, or at device
+/// creation on DXVK's D3D11 when Community Shaders loaded it.
 pub(crate) fn install() -> Result<(), String> {
-    let module = dxvk().or_else(system_d3d11).ok_or("no D3D11 module")?;
+    let Some(module) = dxvk() else {
+        let (device, _) = system_device().ok_or("no system D3D11 device")?;
+        return install_device(&device);
+    };
     let device =
         unsafe { GetProcAddress(module, s!("D3D11CreateDevice")) }.ok_or("no D3D11CreateDevice")?;
     let swap_chain = unsafe { GetProcAddress(module, s!("D3D11CreateDeviceAndSwapChain")) }

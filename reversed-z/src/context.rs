@@ -20,20 +20,17 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use sre::raw::globals;
-use windows::Win32::Foundation::HMODULE;
-use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE, D3D_DRIVER_TYPE_WARP};
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_BIND_CONSTANT_BUFFER, D3D11_BUFFER_DESC, D3D11_COMPARISON_FUNC, D3D11_COMPARISON_GREATER,
     D3D11_COMPARISON_GREATER_EQUAL, D3D11_COMPARISON_LESS, D3D11_COMPARISON_LESS_EQUAL,
     D3D11_DEPTH_STENCIL_DESC, D3D11_DEPTH_STENCIL_VIEW_DESC, D3D11_DEVICE_CONTEXT_IMMEDIATE, D3D11_DEPTH_WRITE_MASK_ALL,
-    D3D11_RASTERIZER_DESC, D3D11_SDK_VERSION, D3D11_USAGE_DEFAULT, D3D11_VIEWPORT, ID3D11Buffer,
+    D3D11_RASTERIZER_DESC, D3D11_USAGE_DEFAULT, D3D11_VIEWPORT, ID3D11Buffer,
     ID3D11DepthStencilState, ID3D11DepthStencilView, ID3D11Device, ID3D11DeviceContext,
-    ID3D11DeviceContext_Vtbl, ID3D11DomainShader, ID3D11PixelShader, ID3D11RasterizerState, ID3D11RenderTargetView,
+    ID3D11DomainShader, ID3D11PixelShader, ID3D11RasterizerState, ID3D11RenderTargetView,
     ID3D11Resource, ID3D11UnorderedAccessView, ID3D11VertexShader,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
-use windows::Win32::System::LibraryLoader::GetProcAddress;
-use windows::core::{HRESULT, IUnknown, Interface, s};
+use windows::core::{IUnknown, Interface};
 
 type SetTargetsFn = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void, *mut c_void);
 type SetTargetsUavFn = unsafe extern "system" fn(
@@ -286,51 +283,9 @@ pub(crate) fn install() -> Result<(), String> {
     install_hooks(context.vtable())
 }
 
-type CreateDeviceFn = unsafe extern "system" fn(
-    *mut c_void,
-    D3D_DRIVER_TYPE,
-    HMODULE,
-    u32,
-    *const c_void,
-    u32,
-    u32,
-    *mut *mut c_void,
-    *mut c_void,
-    *mut *mut c_void,
-) -> HRESULT;
-
 /// The hooks are on the system's context below a wrapper's.
 static BELOW_WRAPPER: AtomicBool = AtomicBool::new(false);
 static SYSTEM_SETUP_FAILED: AtomicBool = AtomicBool::new(false);
-
-/// Runs `f` on the system D3D11's immediate context table, read from a WARP device of its own that
-/// lives as long as the call (the table belongs to the device).
-fn with_system_table<R>(f: impl FnOnce(&ID3D11DeviceContext_Vtbl) -> R) -> Option<R> {
-    let module = crate::shader::system_d3d11()?;
-    let create: CreateDeviceFn =
-        unsafe { core::mem::transmute(GetProcAddress(module, s!("D3D11CreateDevice"))?) };
-    let (mut device, mut context) = (core::ptr::null_mut(), core::ptr::null_mut());
-    unsafe {
-        create(
-            core::ptr::null_mut(),
-            D3D_DRIVER_TYPE_WARP,
-            HMODULE::default(),
-            0,
-            core::ptr::null(),
-            0,
-            D3D11_SDK_VERSION,
-            &raw mut device,
-            core::ptr::null_mut(),
-            &raw mut context,
-        )
-    }
-    .ok()
-    .ok()?;
-    let _device = (!device.is_null()).then(|| unsafe { ID3D11Device::from_raw(device) });
-    let context =
-        (!context.is_null()).then(|| unsafe { ID3D11DeviceContext::from_raw(context) })?;
-    Some(f(context.vtable()))
-}
 
 /// Hooks the system's context when the game's is a wrapper's (ENB): the wrapper draws with
 /// shaders and depth tests of its own there, past the game's table. The wrapper hands the game
@@ -339,22 +294,22 @@ fn install_below_wrapper(game: &ID3D11DeviceContext) -> Result<bool, String> {
     if crate::shader::dxvk().is_some() {
         return Ok(false);
     }
-    let game = game.vtable();
-    with_system_table(|table| {
-        if table.OMSetDepthStencilState as usize == game.OMSetDepthStencilState as usize {
-            return Ok(false);
-        }
-        if let Err(e) = create_hooks(table) {
-            crate::log(&format!(
-                "the system's context below the game's could not be hooked ({e}); the game's is hooked instead"
-            ));
-            return Ok(false);
-        }
-        BELOW_WRAPPER.store(true, Ordering::Relaxed);
-        enable_hooks()?;
-        Ok(true)
-    })
-    .unwrap_or(Ok(false))
+    let Some((_device, system)) = crate::shader::system_device() else {
+        return Ok(false);
+    };
+    let table = system.vtable();
+    if table.OMSetDepthStencilState as usize == game.vtable().OMSetDepthStencilState as usize {
+        return Ok(false);
+    }
+    if let Err(e) = create_hooks(table) {
+        crate::log(&format!(
+            "the system's context below the game's could not be hooked ({e}); the game's is hooked instead"
+        ));
+        return Ok(false);
+    }
+    BELOW_WRAPPER.store(true, Ordering::Relaxed);
+    enable_hooks()?;
+    Ok(true)
 }
 
 /// Enables a hook created into `slot`.
@@ -1651,11 +1606,13 @@ pub(crate) fn counters() -> String {
 mod tests {
     use super::*;
     use crate::twin::tests::{compile, compile_stage};
+    use windows::Win32::Foundation::HMODULE;
     use windows::Win32::Graphics::Direct3D::{
         D3D_DRIVER_TYPE_HARDWARE, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
     };
     use windows::Win32::Graphics::Direct3D11::*;
     use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32G8X24_TYPELESS, DXGI_SAMPLE_DESC};
+    use windows::core::s;
 
     /// CPU time per draw sent through the hooks with a world target bound, against the same draws
     /// with no hooks. `cargo test --release -p reversed-z per_draw_cost -- --ignored --nocapture`
