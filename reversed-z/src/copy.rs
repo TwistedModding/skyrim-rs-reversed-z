@@ -6,7 +6,6 @@
 
 use core::ffi::c_void;
 use std::cell::Cell;
-use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
@@ -62,14 +61,19 @@ pub(crate) const DOMAIN: usize = 5;
 
 /// The copy views bound in each shader stage's resource slots, so a copy whose target is unbound
 /// or copied into is refreshed then only while a reader still has it bound; otherwise the reader
-/// that binds it next refreshes it.
+/// that binds it next refreshes it. There are only a few copies, so the views and their bind counts
+/// are scanned rather than hashed.
 struct Bindings {
-    views: HashSet<usize>,
+    views: Vec<usize>,
     slots: [[usize; SLOTS]; 6],
-    bound: HashMap<usize, u32>,
+    bound: Vec<(usize, u32)>,
 }
 
-static BINDINGS: Mutex<Option<Bindings>> = Mutex::new(None);
+static BINDINGS: Mutex<Bindings> = Mutex::new(Bindings {
+    views: Vec::new(),
+    slots: [[0; SLOTS]; 6],
+    bound: Vec::new(),
+});
 static SHADER_OBJECT: Mutex<Option<ID3D11ComputeShader>> = Mutex::new(None);
 static STANDARD_SHADER_OBJECT: Mutex<Option<ID3D11ComputeShader>> = Mutex::new(None);
 static SEEDS: [AtomicUsize; 3] = [const { AtomicUsize::new(0) }; 3];
@@ -400,16 +404,18 @@ fn bound(view: usize) -> bool {
     BINDINGS
         .lock()
         .unwrap()
-        .as_ref()
-        .is_some_and(|b| b.bound.contains_key(&view))
+        .bound
+        .iter()
+        .any(|&(v, _)| v == view)
 }
 
 /// Records the views sent to `count` resource slots of `stage` from `start`; `None` unbinds them.
 pub(crate) fn bind_views(stage: usize, start: u32, count: u32, views: Option<&[*mut c_void]>) {
-    let mut bindings = BINDINGS.lock().unwrap();
-    let Some(b) = bindings.as_mut() else {
+    let mut b = BINDINGS.lock().unwrap();
+    if b.views.is_empty() {
         return;
-    };
+    }
+    let b = &mut *b;
     for i in 0..count as usize {
         let Some(slot) = b.slots[stage].get_mut(start as usize + i) else {
             break;
@@ -420,15 +426,18 @@ pub(crate) fn bind_views(stage: usize, start: u32, count: u32, views: Option<&[*
             continue;
         }
         if *slot != 0
-            && let Some(n) = b.bound.get_mut(slot)
+            && let Some(at) = b.bound.iter().position(|&(v, _)| v == *slot)
         {
-            *n -= 1;
-            if *n == 0 {
-                b.bound.remove(slot);
+            b.bound[at].1 -= 1;
+            if b.bound[at].1 == 0 {
+                b.bound.swap_remove(at);
             }
         }
         if copy != 0 {
-            *b.bound.entry(copy).or_default() += 1;
+            match b.bound.iter_mut().find(|(v, _)| *v == copy) {
+                Some((_, n)) => *n += 1,
+                None => b.bound.push((copy, 1)),
+            }
         }
         *slot = copy;
     }
@@ -436,10 +445,10 @@ pub(crate) fn bind_views(stage: usize, start: u32, count: u32, views: Option<&[*
 
 /// The stages and slots that hold `view`.
 fn held(view: usize) -> Vec<(usize, u32)> {
-    let bindings = BINDINGS.lock().unwrap();
-    let Some(b) = bindings.as_ref().filter(|b| b.bound.contains_key(&view)) else {
+    let b = BINDINGS.lock().unwrap();
+    if !b.bound.iter().any(|&(v, _)| v == view) {
         return Vec::new();
-    };
+    }
     b.slots
         .iter()
         .enumerate()
@@ -455,10 +464,9 @@ fn held(view: usize) -> Vec<(usize, u32)> {
 
 /// Forgets every bound view after the context's state is cleared.
 pub(crate) fn unbind_views() {
-    if let Some(b) = BINDINGS.lock().unwrap().as_mut() {
-        b.slots = [[0; SLOTS]; 6];
-        b.bound.clear();
-    }
+    let mut b = BINDINGS.lock().unwrap();
+    b.slots = [[0; SLOTS]; 6];
+    b.bound.clear();
 }
 
 pub(crate) fn stand_in(context: &ID3D11DeviceContext, view: *mut c_void) -> Option<*mut c_void> {
@@ -621,16 +629,7 @@ fn create_copy(
     unsafe { device.CreateUnorderedAccessView(&standard, None, Some(&raw mut unordered)) }
         .map_err(|e| format!("copy target: {e}"))?;
     let view = view.ok_or("copy view")?;
-    BINDINGS
-        .lock()
-        .unwrap()
-        .get_or_insert_with(|| Bindings {
-            views: HashSet::new(),
-            slots: [[0; SLOTS]; 6],
-            bound: HashMap::new(),
-        })
-        .views
-        .insert(view.as_raw() as usize);
+    BINDINGS.lock().unwrap().views.push(view.as_raw() as usize);
     Ok(Copy {
         standard,
         view,

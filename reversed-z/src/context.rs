@@ -1621,7 +1621,8 @@ mod tests {
     };
     use windows::Win32::Graphics::Direct3D11::*;
     use windows::Win32::Graphics::Dxgi::Common::{
-        DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS, DXGI_FORMAT_R32G8X24_TYPELESS, DXGI_SAMPLE_DESC,
+        DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS,
+        DXGI_FORMAT_R32G8X24_TYPELESS, DXGI_SAMPLE_DESC,
     };
     use windows::core::s;
 
@@ -1719,6 +1720,33 @@ mod tests {
         }
         .unwrap();
         let reader = reader.unwrap();
+        let textures: Vec<Option<ID3D11ShaderResourceView>> = (0..8)
+            .map(|_| {
+                let desc = D3D11_TEXTURE2D_DESC {
+                    Width: 4,
+                    Height: 4,
+                    MipLevels: 1,
+                    ArraySize: 1,
+                    Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                    SampleDesc: DXGI_SAMPLE_DESC {
+                        Count: 1,
+                        Quality: 0,
+                    },
+                    Usage: D3D11_USAGE_DEFAULT,
+                    BindFlags: D3D11_BIND_SHADER_RESOURCE.0.cast_unsigned(),
+                    ..Default::default()
+                };
+                let mut texture = None;
+                unsafe { device.CreateTexture2D(&raw const desc, None, Some(&raw mut texture)) }
+                    .unwrap();
+                let mut view = None;
+                unsafe {
+                    device.CreateShaderResourceView(&texture.unwrap(), None, Some(&raw mut view))
+                }
+                .unwrap();
+                view
+            })
+            .collect();
         let state_desc = D3D11_DEPTH_STENCIL_DESC {
             DepthEnable: true.into(),
             DepthWriteMask: D3D11_DEPTH_WRITE_MASK_ALL,
@@ -1766,6 +1794,10 @@ mod tests {
                 context.Draw(3, 0);
             });
             println!("{label}: {same} ns per draw, {changing} with shaders changing every draw");
+            let textures = best(&|i| unsafe {
+                context.PSSetShaderResources((i & 1) * 8, Some(&textures));
+            });
+            println!("{label}: {textures} ns per bind of 8 textures");
             unsafe { context.ClearState() };
         };
         run("warm-up");
