@@ -20,7 +20,8 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use framework::Host;
-use framework::hooks::Location;
+use framework::hooks::ops::Raw;
+use framework::hooks::{Location, Options};
 use skyrim::input::{Arg, Command, CommandContext, Param};
 use sre::ScriptParamType;
 use sre::raw::fns;
@@ -44,6 +45,10 @@ static HOST: OnceLock<&'static Host> = OnceLock::new();
 static WANTED: AtomicBool = AtomicBool::new(true);
 /// The context hooks are in and the world depth target is a float target.
 static READY: AtomicBool = AtomicBool::new(false);
+/// The far plane the engine gives a world with LOD.
+const ENGINE_FAR: f32 = 353_840.0;
+/// The far plane kept for such a world: past the farthest LOD.
+const FAR: f32 = 2.0 * ENGINE_FAR;
 
 /// `Renderer::CreateDepthStencilObjects` takes a stencil target's formats from one immediate
 /// (`D24_UNORM_S8_UINT`) and register offsets of it, and the 16-bit targets' from the same register:
@@ -69,6 +74,63 @@ pub(crate) fn log(line: &str) {
     }
 }
 
+/// Keeps the far plane of a world with LOD at `FAR`, through the scene graph's own far override,
+/// while the plugin is loaded. The engine's far plane is flat and nearer than the farthest LOD, so
+/// far land and water were cut along a line that swept over them as the camera turned. A world
+/// whose far is not the engine's LOD distance is left alone, and so is an override someone else
+/// set (the map menu's). Once a frame, on the main thread.
+fn keep_far() {
+    let Some(graph) = sre::g_scene_graph() else {
+        return;
+    };
+    // +0x144 the override, +0x149 whether it is used
+    let overridden = graph.field_148 >> 8 != 0;
+    #[allow(clippy::cast_possible_truncation)]
+    let value = (graph.field_140 >> 32) as u32;
+    if overridden && value != FAR.to_bits() {
+        return;
+    }
+    if overridden {
+        graph.clear_far_distance_override();
+    }
+    // slot 62, the far distance, through the graph's own table
+    let far: unsafe extern "C" fn(*const sre::SceneGraph) -> f32 =
+        unsafe { core::mem::transmute((*graph.__vftable).slot_62) };
+    if READY.load(Ordering::Acquire) && unsafe { far(graph) }.to_bits() == ENGINE_FAR.to_bits() {
+        graph.set_far_distance_override(FAR);
+    }
+}
+
+type CubeMapCamera = unsafe extern "C" fn(usize, usize, usize, usize) -> usize;
+
+/// The water's cube-map camera takes the main camera's far and raises its own near to a ten
+/// thousandth of it for good: it is shown the engine's far. The far plane is only moved where this
+/// is in place.
+fn keep_cube_map_far(host: &'static Host) -> Result<(), String> {
+    // looked up without a manifest record: a runtime that cannot place it keeps its own far plane
+    let at = skyrim::reloc()
+        .location(fns::Msg_ClearLists_sub0_sub1_sub5)
+        .map_err(|e| e.to_string())?;
+    host.hooks()
+        .around(
+            Raw::<CubeMapCamera>::at(at),
+            Options::new(host.name()),
+            |args, next| {
+                let far = sre::get_main_camera()
+                    .map(|camera| (&raw const camera.frustumFar).cast_mut())
+                    .filter(|&far| unsafe { far.read() } > ENGINE_FAR);
+                let moved = far.map(|far| unsafe { far.replace(ENGINE_FAR) });
+                let result = unsafe { next.call(args) };
+                if let (Some(far), Some(moved)) = (far, moved) {
+                    unsafe { far.write(moved) };
+                }
+                result
+            },
+        )
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
 /// The world view is drawn reversed.
 pub(crate) fn active() -> bool {
     READY.load(Ordering::Acquire) && WANTED.load(Ordering::Relaxed)
@@ -90,6 +152,10 @@ fn load(host: &'static Host) -> bool {
             log(&format!("depth format patch refused: {e}"));
             return false;
         }
+    }
+    match keep_cube_map_far(host) {
+        Ok(()) => host.on_frame(keep_far),
+        Err(e) => log(&format!("far plane left at the engine's: {e}")),
     }
     if let Err(e) = shader::install() {
         log(&format!("replacement shader capture unavailable: {e}"));
@@ -131,6 +197,7 @@ fn engage() {
 
 fn unload() {
     READY.store(false, Ordering::Release);
+    keep_far();
     context::remove();
     vulkan::remove();
     context::release_push_scale();
