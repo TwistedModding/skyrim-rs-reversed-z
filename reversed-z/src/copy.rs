@@ -798,31 +798,12 @@ fn convert(context: &ID3D11DeviceContext, shader: &ID3D11ComputeShader, c: &Copy
 }
 
 #[cfg(test)]
-fn alias_index(view: *mut c_void, textures: &[usize]) -> Option<usize> {
-    let view = unsafe { ID3D11ShaderResourceView::from_raw_borrowed(&view) }?;
-    let mut desc = D3D11_SHADER_RESOURCE_VIEW_DESC::default();
-    unsafe { view.GetDesc(&raw mut desc) };
-    if !matches!(
-        desc.Format,
-        DXGI_FORMAT_R32_FLOAT
-            | DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS
-            | DXGI_FORMAT_R24_UNORM_X8_TYPELESS
-    ) {
-        return None;
-    }
-    let resource = unsafe { view.GetResource() }.ok()?;
-    textures
-        .iter()
-        .position(|&texture| texture == resource.as_raw() as usize)
-}
-
-#[cfg(test)]
 pub(crate) mod tests {
     use super::*;
     use windows::Win32::Graphics::Direct3D::D3D_SRV_DIMENSION_TEXTURE2D;
     use windows::Win32::Graphics::Direct3D11::*;
     use windows::Win32::Graphics::Dxgi::Common::{
-        DXGI_FORMAT_R32G8X24_TYPELESS, DXGI_FORMAT_X32_TYPELESS_G8X24_UINT,
+        DXGI_FORMAT_R32G8X24_TYPELESS,
     };
 
     #[allow(clippy::too_many_lines)]
@@ -865,14 +846,6 @@ pub(crate) mod tests {
             view.unwrap()
         };
         let original = make_view(DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS);
-        let alias = make_view(DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS);
-        let stencil = make_view(DXGI_FORMAT_X32_TYPELESS_G8X24_UINT);
-        let textures = [depth.as_raw() as usize];
-        assert_ne!(original.as_raw(), alias.as_raw());
-        assert_eq!(alias_index(original.as_raw(), &textures), Some(0));
-        assert_eq!(alias_index(alias.as_raw(), &textures), Some(0));
-        assert_eq!(alias_index(stencil.as_raw(), &textures), None);
-        assert_eq!(alias_index(alias.as_raw(), &[0]), None);
 
         let data: Vec<f32> = (0..143)
             .map(|i| f32::from(u16::try_from(i).unwrap()) / 143.0)

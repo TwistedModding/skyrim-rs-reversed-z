@@ -289,14 +289,14 @@ pub(crate) fn is_prepared(world: vk::Image) -> bool {
 /// Records the conversion of `world` into its copy: the image taken to GENERAL from the layout
 /// its rendering left it in and back after, the copy fenced against every earlier and later use.
 #[allow(clippy::too_many_lines)]
-pub(crate) fn record(buffer: vk::CommandBuffer, world: vk::Image, layout: vk::ImageLayout) -> bool {
+pub(crate) fn record(buffer: vk::CommandBuffer, world: vk::Image, layout: vk::ImageLayout) {
     let guard = CONVERTER.lock().unwrap();
     let Some(c) = guard.as_ref() else {
-        return false;
+        return;
     };
     let prepared = PREPARED.lock().unwrap();
     let Some(p) = prepared.get(&world.as_raw()) else {
-        return false;
+        return;
     };
     let f = &c.functions;
     let depth_range = vk::ImageSubresourceRange {
@@ -401,7 +401,6 @@ pub(crate) fn record(buffer: vk::CommandBuffer, world: vk::Image, layout: vk::Im
         );
     }
     RECORDED.fetch_add(1, Ordering::Relaxed);
-    true
 }
 
 /// The compute shader: `copy[id] = 1 - depth[id]` for every texel of the copy.

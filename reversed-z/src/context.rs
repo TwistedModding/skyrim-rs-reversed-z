@@ -81,7 +81,8 @@ const D3D11_CLEAR_DEPTH: u32 = 1;
 /// Each precise twin receives [near / 15, A - 1, A near, orthographic]; A - 1 as A near / far,
 /// the derivation Drawcall Limit Fix's twins share, so the two paths agree bit for bit.
 /// The near plane the engine's far push was made for.
-const VANILLA_NEAR: f32 = 15.0;
+pub(crate) const VANILLA_NEAR: f32 = 15.0;
+
 const KEEP_TARGETS: u32 = 0xffff_ffff;
 const VIEWPORTS: usize = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE as usize;
 
@@ -1215,14 +1216,7 @@ macro_rules! resource_hook {
                 (!sent.is_null())
                     .then(|| unsafe { core::slice::from_raw_parts(sent, count as usize) }),
             );
-            unsafe {
-                original(&$slot)(
-                    context,
-                    start,
-                    count,
-                    swapped.as_ref().map_or(views, Vec::as_ptr),
-                )
-            };
+            unsafe { original(&$slot)(context, start, count, sent) };
         }
     };
 }
@@ -1496,7 +1490,7 @@ impl Deref for Viewports {
 
 /// `given` with depth ranges mirrored while a depth-tested world view is bound.
 fn viewports(given: &[D3D11_VIEWPORT]) -> Viewports {
-    let bound = BOUND.load(Ordering::Relaxed) && DEPTH_TESTS.load(Ordering::Relaxed);
+    let bound = mirrored();
     let mut sent = Viewports {
         list: [D3D11_VIEWPORT::default(); VIEWPORTS],
         len: given.len().min(VIEWPORTS),
@@ -1518,7 +1512,6 @@ fn viewports(given: &[D3D11_VIEWPORT]) -> Viewports {
 /// The shader to bind: the engine's, or its twin while a world view is bound. A twin is made from
 /// the bytecode of the engine's current record the first time its shader is bound under a world view.
 fn vertex_shader(shader: *mut c_void) -> *mut c_void {
-    VERTEX_CONSTANT_SLOT.store(u32::MAX, Ordering::Relaxed);
     if !BOUND.load(Ordering::Relaxed) || shader.is_null() {
         return shader;
     }
@@ -1578,7 +1571,7 @@ fn mirrored_func(f: D3D11_COMPARISON_FUNC) -> D3D11_COMPARISON_FUNC {
 
 /// The state to send: the engine's, or its mirrored twin while a world view is bound.
 fn depth_state(state: *mut c_void) -> *mut c_void {
-    if !BOUND.load(Ordering::Relaxed) || !DEPTH_TESTS.load(Ordering::Relaxed) {
+    if !mirrored() {
         return state;
     }
     twin(&MIRRORED_DEPTH, state, |device| {
@@ -1600,7 +1593,7 @@ fn depth_state(state: *mut c_void) -> *mut c_void {
 
 fn raster(state: *mut c_void) -> *mut c_void {
     let Some(s) = unsafe { ID3D11RasterizerState::from_raw_borrowed(&state) }
-        .filter(|_| BOUND.load(Ordering::Relaxed) && DEPTH_TESTS.load(Ordering::Relaxed))
+        .filter(|_| mirrored())
     else {
         return state;
     };

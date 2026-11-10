@@ -52,7 +52,6 @@ const VIEW_PROJECTION_OFFSET: u32 = 128;
 const PUSH_START: f32 = 70_000.0;
 const PUSH_SLOPE: f32 = 0.0001;
 const PUSH_HEIGHT: f32 = 0.5;
-const VANILLA_NEAR: f32 = 15.0;
 
 fn opcode(op: u16, len: u32) -> u32 {
     u32::from(op) | (len << 16)
@@ -396,7 +395,7 @@ pub(crate) fn mirrored(code: &[u32], far: Option<f32>) -> Option<Vec<u32>> {
         let column = existing(source.int, 3).unwrap_or_else(|| out.constant(source.int, 3));
         let floats = [
             1.0 / far,
-            1.0 / VANILLA_NEAR,
+            1.0 / crate::context::VANILLA_NEAR,
             PUSH_START,
             PUSH_SLOPE,
             PUSH_HEIGHT,

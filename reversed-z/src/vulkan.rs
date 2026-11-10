@@ -915,13 +915,11 @@ fn begin(buffer: vk::CommandBuffer, info: *const vk::RenderingInfo<'static>, rea
     let state = buffers.entry(buffer.as_raw()).or_default();
     state.image = if reversed { image.unwrap_or(0) } else { 0 };
     state.layout = attachment.map_or(vk::ImageLayout::UNDEFINED, |a| a.image_layout);
-    {
-        state.reversed = reversed;
-        send_viewports(buffer, state);
-        send_bias(buffer, state);
-        send_compare(buffer, state);
-        apply_pipeline(buffer, state);
-    }
+    state.reversed = reversed;
+    send_viewports(buffer, state);
+    send_bias(buffer, state);
+    send_compare(buffer, state);
+    apply_pipeline(buffer, state);
 }
 
 unsafe extern "system" fn begin_rendering(buffer: vk::CommandBuffer, info: *const vk::RenderingInfo<'static>) {
