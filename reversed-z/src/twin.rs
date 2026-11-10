@@ -9,6 +9,10 @@
 //! a float near the distance, so its rounding alone moves a far surface by about ulp(z) z / near;
 //! from w that rounding is scaled by A - 1 (about near / far) and far surfaces keep their order at
 //! any near. The far push the engine adds after clip z is carried over, scaled by near / 15.
+//! The engine's push is a clamped ramp worked out per vertex, which a large triangle across the
+//! ramp interpolates wrongly (distant water against the seabed under it), so the twin gives a
+//! push in proportion to clip z in its place: linear, so every triangle interpolates it exactly,
+//! and still behind the rest.
 //! An unused constant-buffer slot carries the projection and scale. Otherwise (screen quads, constant
 //! depth, the sky's z = w) the shader ends with z = w - z.
 
@@ -20,6 +24,11 @@ const DIV: u32 = 14;
 const DP2: u32 = 15;
 const DP3: u32 = 16;
 const DP4: u32 = 17;
+const ENDIF: u32 = 21;
+const ENDLOOP: u32 = 22;
+const ENDSWITCH: u32 = 23;
+const IF: u32 = 31;
+const LOOP: u32 = 48;
 const LT: u32 = 49;
 const MAD: u32 = 50;
 const MIN: u32 = 51;
@@ -30,6 +39,7 @@ const MOVC: u32 = 55;
 const MUL: u32 = 56;
 const RET: u32 = 62;
 const RETC: u32 = 63;
+const SWITCH: u32 = 76;
 const DCL_CONSTANT_BUFFER: u32 = 89;
 const DCL_GLOBAL_FLAGS: u32 = 106;
 const DCL_OUTPUT_SIV: u32 = 103;
@@ -48,7 +58,11 @@ const INPUT: u32 = 1;
 const OUTPUT: u32 = 2;
 const IMMEDIATE32: u32 = 4;
 const IMMEDIATE64: u32 = 5;
+const SAMPLER: u32 = 6;
+const RESOURCE: u32 = 7;
 const CONSTANT_BUFFER: u32 = 8;
+const IMMEDIATE_CONSTANT_BUFFER: u32 = 9;
+const NULL: u32 = 13;
 const OUTPUT_DEPTH: u32 = 12;
 const OUTPUT_DEPTH_GREATER_EQUAL: u32 = 38;
 const OUTPUT_DEPTH_LESS_EQUAL: u32 = 39;
@@ -314,7 +328,8 @@ fn slice(code: &[Instruction], position: u32, comp: u8) -> Option<Slice> {
         for c in components(hit) {
             for s in &ins.operands[1..] {
                 match s.kind {
-                    IMMEDIATE32 | IMMEDIATE64 | CONSTANT_BUFFER | INPUT => {}
+                    IMMEDIATE32 | IMMEDIATE64 | CONSTANT_BUFFER | INPUT | SAMPLER | RESOURCE
+                    | IMMEDIATE_CONSTANT_BUFFER | NULL => {}
                     TEMP => {
                         let r = s.register()?;
                         need.extend(
@@ -334,26 +349,68 @@ fn slice(code: &[Instruction], position: u32, comp: u8) -> Option<Slice> {
 /// Temps past the shader's own: the redirected position, and standard clip z with the twin's work.
 const POSITION: u32 = 0;
 const KEPT: u32 = 1;
+const PUSH: u32 = 2;
 
 /// The last dot product of position z that depends on the z row of a matrix whose w row position w
-/// reads (standard clip z), and the component it writes.
-fn clip_z(code: &[Instruction], position: u32) -> Option<(usize, u8)> {
+/// reads (standard clip z) and the component it writes. None where clip z is computed, or the
+/// shader returns, inside a branch or a loop: the twin's ending needs the kept z on every path.
+struct ClipZ {
+    leaf: usize,
+    component: u8,
+    /// z reads the w row too (a z held at w, where the w row is the only row w reads).
+    held: bool,
+    /// The instruction that adds the far push to standard z, when only moves and minimums follow
+    /// it on the way to the position.
+    push: Option<usize>,
+}
+
+/// The engine's push at the end of its ramp over the clip z there: the push per unit of clip z
+/// that meets the engine's at 80,000.
+const LINEAR_PUSH: f32 = 0.5 / 80_000.0;
+
+/// The operand of an `add` or `mad` that is added to `(register, component)`, read unmodified.
+fn addend_to(ins: &Instruction, hit: u8, register: u32, component: u8) -> Option<usize> {
+    let is_z = |s: &Operand| {
+        s.kind == TEMP
+            && !s.extended
+            && s.register() == Some(register)
+            && s.swizzle[hit.trailing_zeros() as usize] == component
+    };
+    match (ins.op, ins.operands.as_slice()) {
+        (MAD, [_, _, _, z]) if is_z(z) => Some(1),
+        (ADD, [_, a, z]) if is_z(z) && !is_z(a) => Some(1),
+        (ADD, [_, z, a]) if is_z(z) && !is_z(a) => Some(2),
+        _ => None,
+    }
+}
+
+fn clip_z(code: &[Instruction], position: u32) -> Option<ClipZ> {
     let (z_slice, z_rows) = slice(code, position, 2)?;
     let (_, w_rows) = slice(code, position, 3)?;
     let mut z_only = z_rows.difference(&w_rows);
-    let mut w_only = w_rows.difference(&z_rows);
-    let (Some(&z_row), None, Some(&w_row), None) =
-        (z_only.next(), z_only.next(), w_only.next(), w_only.next())
-    else {
+    let (Some(&z_row), None) = (z_only.next(), z_only.next()) else {
         return None;
+    };
+    let mut w_only = w_rows.difference(&z_rows);
+    let (w_row, held) = match (w_only.next(), w_only.next()) {
+        (Some(&row), None) => (row, false),
+        (None, _) if w_rows.len() == 1 => (*w_rows.first()?, true),
+        _ => return None,
     };
     if z_row.0 != w_row.0 {
         return None;
     }
     let mut writer: HashMap<(u32, u8), usize> = HashMap::new();
     let mut dependent: BTreeSet<usize> = BTreeSet::new();
-    let mut leaf = None;
+    let mut leaf: Option<ClipZ> = None;
+    let mut depth = 0u32;
     for (n, ins) in code.iter().enumerate() {
+        match ins.op {
+            IF | LOOP | SWITCH => depth += 1,
+            ENDIF | ENDLOOP | ENDSWITCH => depth = depth.checked_sub(1)?,
+            RET if depth != 0 => return None,
+            _ => {}
+        }
         if let Some(&hit) = z_slice.get(&n) {
             let reads_row = ins.operands[1..].iter().any(|s| {
                 s.element() == Some(z_row)
@@ -367,9 +424,32 @@ fn clip_z(code: &[Instruction], position: u32) -> Option<(usize, u8)> {
                         }))
             });
             if reads_row {
+                if depth != 0 {
+                    return None;
+                }
                 dependent.insert(n);
                 if dot_width(ins.op).is_some() && hit.is_power_of_two() {
-                    leaf = Some((n, components(hit).next()?));
+                    leaf = Some(ClipZ {
+                        leaf: n,
+                        component: components(hit).next()?,
+                        held,
+                        push: None,
+                    });
+                } else if let Some(z) = &mut leaf {
+                    let d = &code[z.leaf].operands[0];
+                    let addend = d
+                        .register()
+                        .filter(|r| {
+                            hit.is_power_of_two()
+                                && d.kind == TEMP
+                                && writer.get(&(*r, z.component)) == Some(&z.leaf)
+                        })
+                        .and_then(|r| addend_to(ins, hit, r, z.component));
+                    if addend.is_some() {
+                        z.push = Some(n);
+                    } else if !matches!(ins.op, MOV | MIN) {
+                        z.push = None;
+                    }
                 }
             }
         }
@@ -381,16 +461,70 @@ fn clip_z(code: &[Instruction], position: u32) -> Option<(usize, u8)> {
 /// Instructions inserted after given instructions of the program.
 type Inserted = HashMap<usize, Vec<u32>>;
 
+/// The sum in `KEPT.z` written to the position, not below w less the shader's own z where the
+/// shader held that z under standard z plus the push (by more than rounding): a z held at or just
+/// inside the far plane stays there instead of being clipped past it.
+fn held_ending(base: u32, position_z: Vec<u32>, push: u8) -> [(u32, Vec<Vec<u32>>); 7] {
+    let temp = |r: u32, c: u8, negated: bool| reg(TEMP, base + r, None, [c; 4], negated);
+    let kept = |c: u8| reg(TEMP, base + KEPT, Some(1 << c), XYZW, false);
+    let w_less_z = || vec![temp(POSITION, 3, false), temp(POSITION, 2, true)];
+    let rounding = vec![1 | (IMMEDIATE32 << 12), (1.0f32 / 1_048_576.0).to_bits()];
+    [
+        (ADD, vec![kept(3), temp(KEPT, 0, false), temp(PUSH, push, false)]),
+        (ADD, vec![kept(3), temp(KEPT, 3, false), temp(POSITION, 2, true)]),
+        (MUL, vec![kept(1), temp(POSITION, 3, false), rounding]),
+        (LT, vec![kept(3), temp(KEPT, 1, false), temp(KEPT, 3, false)]),
+        (ADD, [vec![kept(1)], w_less_z()].concat()),
+        (MAX, vec![kept(1), temp(KEPT, 1, false), temp(KEPT, 2, false)]),
+        (
+            MOVC,
+            vec![
+                position_z,
+                temp(KEPT, 3, false),
+                temp(KEPT, 1, false),
+                temp(KEPT, 2, false),
+            ],
+        ),
+    ]
+}
+
+/// The instruction that keeps in `PUSH` what `ins` adds to standard z, and the component kept.
+fn keep_push(
+    tok: &[u32],
+    ins: &Instruction,
+    base: u32,
+    standard: u32,
+    c: u8,
+) -> Option<(Vec<u32>, u8)> {
+    let mask = ins.operands[0].mask?;
+    let first = addend_to(ins, mask, standard, c)?;
+    let to = reg(TEMP, base + PUSH, Some(mask), XYZW, false);
+    let source = |k: usize| &tok[ins.operands[k].start..ins.operands[k].end];
+    let keep = if ins.op == MAD {
+        instruction(MUL, &[&to, source(first), source(first + 1)])
+    } else {
+        instruction(MOV, &[&to, source(first)])
+    };
+    Some((keep, u8::try_from(mask.trailing_zeros()).ok()?))
+}
+
 /// The precise twin's additions: standard clip z kept in `KEPT.x` after the instruction that computes
-/// it, and the ending: the far push, scaled, and z = w - z from w, or from standard z where the
-/// projection's w row is (0, 0, 0, 1) (orthographic).
+/// it, the far push kept in `PUSH` before the instruction that adds it (taken from the sum
+/// otherwise, which is rounded to clip z's precision), and the ending: the far push, scaled, z = w - z from w, or from standard z where the
+/// projection's w row is (0, 0, 0, 1) (orthographic). A z the shader held at w stays on the far
+/// plane instead of being clipped past it.
 fn precise(
+    tok: &[u32],
     code: &[Instruction],
     position: u32,
     base: u32,
     slot: u32,
-    leaf: usize,
-    c: u8,
+    ClipZ {
+        leaf,
+        component: c,
+        held,
+        push,
+    }: ClipZ,
 ) -> Option<(Inserted, Vec<u32>)> {
     let d = &code[leaf].operands[0];
     let standard = if d.kind == OUTPUT {
@@ -400,16 +534,31 @@ fn precise(
     };
     let temp = |r: u32, c: u8, negated: bool| reg(TEMP, base + r, None, [c; 4], negated);
     let kept = |c: u8| reg(TEMP, base + KEPT, Some(1 << c), XYZW, false);
-    let after = HashMap::from([(
+    let mut after = HashMap::from([(
         leaf,
         instruction(MOV, &[&kept(0), &reg(TEMP, standard, None, [c; 4], false)]),
     )]);
-    let mut out = Vec::new();
-    for (op, operands) in [
-        (
+    let mut push_component = 0;
+    let pushed = match push {
+        Some(n) => {
+            // only the held ending compares with the engine's own push
+            if held {
+                let (keep, component) = keep_push(tok, &code[n], base, standard, c)?;
+                push_component = component;
+                after.entry(n - 1).or_default().extend(keep);
+            }
+            let per_z = vec![1 | (IMMEDIATE32 << 12), (-LINEAR_PUSH).to_bits()];
+            (MUL, vec![kept(1), temp(KEPT, 0, false), per_z])
+        }
+        None => (
             ADD,
             vec![kept(1), temp(KEPT, 0, false), temp(POSITION, 2, true)],
         ),
+    };
+    let position_z = reg(OUTPUT, position, Some(0b0100), XYZW, false);
+    let sum = |to: Vec<u32>| (ADD, vec![to, temp(KEPT, 2, false), temp(KEPT, 1, false)]);
+    let mut steps = vec![
+        pushed,
         (
             MUL,
             vec![kept(1), temp(KEPT, 1, false), cb(slot, 0, 0, false)],
@@ -437,15 +586,15 @@ fn precise(
                 temp(KEPT, 2, false),
             ],
         ),
-        (
-            ADD,
-            vec![
-                reg(OUTPUT, position, Some(0b0100), XYZW, false),
-                temp(KEPT, 2, false),
-                temp(KEPT, 1, false),
-            ],
-        ),
-    ] {
+    ];
+    if held {
+        steps.push(sum(kept(2)));
+        steps.extend(held_ending(base, position_z, push_component));
+    } else {
+        steps.push(sum(position_z));
+    }
+    let mut out = Vec::new();
+    for (op, operands) in steps {
         let operands: Vec<&[u32]> = operands.iter().map(Vec::as_slice).collect();
         out.extend(instruction(op, &operands));
     }
@@ -566,13 +715,17 @@ fn rewrite_position(container: &[u8], precise_allowed: bool) -> Option<Mirrored>
         ],
     );
     let mut constants = None;
-    let after = if let Some((leaf, c)) = clip_z(&code, position).filter(|_| precise_allowed) {
+    // a held z is told from the pushed one by the kept push
+    let found = clip_z(&code, position)
+        .filter(|z| precise_allowed && (!z.held || z.push.is_some()));
+    let held = found.as_ref().is_some_and(|z| z.held);
+    let after = if let Some(leaf) = found {
         let slot = (0..14).rev().find(|&slot| {
             !code
                 .iter()
                 .any(|ins| ins.op == DCL_CONSTANT_BUFFER && tok.get(ins.at + 2) == Some(&slot))
         })?;
-        let (after, ending) = precise(&code, position, base, slot, leaf, c)?;
+        let (after, ending) = precise(&tok, &code, position, base, slot, leaf)?;
         constants = Some(slot);
         tail.extend(ending);
         after
@@ -587,7 +740,7 @@ fn rewrite_position(container: &[u8], precise_allowed: bool) -> Option<Mirrored>
         ));
         HashMap::new()
     };
-    let extra = if after.is_empty() { 1 } else { 2 };
+    let extra = if after.is_empty() { 1 } else { 2 + u32::from(held) };
 
     let mut declared = after.is_empty();
     let mut out = tok[..2].to_vec();
@@ -906,6 +1059,15 @@ pub(crate) mod tests {
     pub(crate) const CONSTANT: &str =
         "float4 main(float4 p : POSITION) : SV_Position { return float4(p.xy, 0.25, 1.0); }\n";
 
+    /// `ROWS` with its z held at `scale` times w, as Community Shaders' water does.
+    pub(crate) fn held(scale: &str) -> String {
+        ROWS.replace(
+            "return o;",
+            &format!("o.z = min(o.z, o.w * {scale});
+ return o;"),
+        )
+    }
+
     fn bytes(blob: &ID3DBlob) -> Vec<u8> {
         unsafe {
             core::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize())
@@ -1026,6 +1188,40 @@ pub(crate) mod tests {
         assert!(twin.contains("cb13[0].zzzz"), "{twin}");
     }
 
+    const DOTS: &str =
+        "float4(dot(rows[0], p), dot(rows[1], p), dot(rows[2], p), dot(rows[3], p))";
+
+    #[test]
+    fn a_position_moved_by_a_texture_read_is_precise() {
+        let source = format!(
+            "Texture2D<float4> offsets : register(t0);
+            cbuffer view : register(b2) {{ float4 rows[4]; }}
+            float4 main(float4 p : POSITION) : SV_Position {{
+                p.xyz += offsets.Load(int3(0, 0, 0)).xyz;
+                return {DOTS};
+            }}
+"
+        );
+        assert_eq!(super::mirrored(&compile(&source)).unwrap().constants, Some(13));
+    }
+
+    #[test]
+    fn clip_z_inside_a_branch_keeps_w_minus_z() {
+        let source = format!(
+            "cbuffer view : register(b2) {{ float4 rows[4]; float4 band; }}
+            float4 main(float4 p : POSITION) : SV_Position {{
+                float4 o = p;
+                [branch] if (band.x > 0) o = {DOTS};
+                return o;
+            }}
+"
+        );
+        let rewritten = super::mirrored(&compile(&source)).unwrap();
+        let twin = text(&rewritten.code);
+        assert!(twin.contains("if_"), "the branch must survive compilation: {twin}");
+        assert_eq!(rewritten.constants, None);
+    }
+
     #[test]
     fn constant_depth_flipped() {
         let rewritten = super::mirrored(&compile(CONSTANT)).unwrap();
@@ -1122,4 +1318,3 @@ pub(crate) mod tests {
         }
     }
 }
-

@@ -519,7 +519,7 @@ pub(crate) fn counters() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::twin::tests::{CONSTANT, ROWS, compile, compile_stage, occupied_slots};
+    use crate::twin::tests::{CONSTANT, ROWS, compile, compile_stage, held, occupied_slots};
     use windows::Win32::Graphics::Direct3D::{
         D3D_DRIVER_TYPE_WARP, D3D_PRIMITIVE_TOPOLOGY_POINTLIST,
     };
@@ -668,6 +668,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn captured_shaders_execute_with_private_constants_and_survive_replacement() {
         install().unwrap();
         let mut device = None;
@@ -689,10 +690,21 @@ mod tests {
         let device = device.unwrap();
         let context = context.unwrap();
         crate::context::create_vertex_constants(&device).unwrap();
-        for source in [ROWS.to_owned(), occupied_slots(&[12, 13])] {
+        let occupied = occupied_slots(&[12, 13]);
+        let inside = 1.0f32 - 16.0 / 16_777_216.0;
+        let holds = [(held("1.0"), 1.0f32), (held("(1.0 - 16.0 / 16777216.0)"), inside)];
+        let unpushed = ROWS.replace("o.z += 0.5 * saturate((o.z - 70000.0) * 0.0001);", "");
+        assert_ne!(unpushed, ROWS);
+        for source in [
+            ROWS.to_owned(),
+            holds[0].0.clone(),
+            holds[1].0.clone(),
+            occupied.clone(),
+            unpushed.clone(),
+        ] {
             let code = compile(&source);
             for near in [2.0f32, 15.0] {
-                for distance in [51_720.0f32, 90_000.0] {
+                for distance in [51_720.0f32, 75_000.37, 90_000.0] {
                     let a = 350_000.0 / (350_000.0 - near);
                     let b = -a * near;
                     let projection = [a, b, 0.0, near / 15.0];
@@ -708,17 +720,24 @@ mod tests {
                         panic!("captured shaders must not use engine records")
                     })
                     .unwrap();
-                    assert_eq!(slot, Some(if source == ROWS { 13 } else { 11 }));
+                    assert_eq!(slot, Some(if source == occupied { 11 } else { 13 }));
                     let cached = mirrored(&original, || panic!("cached twin")).unwrap();
                     assert_eq!(cached.0.as_raw(), twin.as_raw());
                     drop(cached);
                     drop(original);
-                    let reversed =
-                        execute(&device, &context, &twin, &code, projection, slot, distance);
-                    let push = 0.5 * ((distance * a + b - 70_000.0) * 0.0001).clamp(0.0, 1.0);
+                    let run = |distance| {
+                        execute(&device, &context, &twin, &code, projection, slot, distance)
+                    };
+                    let reversed = run(distance);
+                    // a pushed shader's push is 0.5 at clip z 80,000 and in proportion elsewhere
+                    let push = if source == unpushed {
+                        0.0
+                    } else {
+                        0.5 / 80_000.0 * (distance * a + b) * near / 15.0
+                    };
                     let expected = f64::from(-b)
                         - f64::from(a - 1.0) * f64::from(distance)
-                        - f64::from(push * near / 15.0);
+                        - f64::from(push);
                     assert!(
                         (f64::from(reversed[2]) - expected).abs() < 0.000_01,
                         "near {near}, distance {distance}: {reversed:?}, expected {expected}"
@@ -727,6 +746,14 @@ mod tests {
                         assert_eq!(
                             reversed[i], vanilla[i],
                             "position and fog must be preserved"
+                        );
+                    }
+                    if let Some((_, scale)) = holds.iter().find(|(held, _)| *held == source) {
+                        let past = run(400_000.0);
+                        assert_eq!(
+                            past[2],
+                            past[3] - past[3] * scale,
+                            "a z held past the far plane stays where the shader held it"
                         );
                     }
                 }

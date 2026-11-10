@@ -15,6 +15,7 @@ Install the package with a mod manager, or copy its `SKSE` folder into the game'
 
 - On by default. `reversed-z.log` in `Documents\My Games\Skyrim Special Edition\SKSE\` says `ready: world depth targets are D32 float, on` after the game data loads; `not engaged: ...` or `depth format patch ... refused` says why it stayed off.
 - The console command `ReversedZ` prints the state; `ReversedZ off` and `ReversedZ on` switch it at the next frame. The choice is kept in `Data\SKSE\Plugins\skyrim-runtime-extender\reversed-z.settings.json` (`"enabled"`).
+- While Reversed Z is on, the push the game gives distant land and water in depth grows in proportion to distance instead of starting at 70,000 units: it is the game's at 80,000, less before and more beyond. The game works its push out at each corner of a triangle, and distant water is a few very large triangles, so water and the seabed under it were pushed differently and the seabed showed through in patches that changed as the camera turned.
 - To check it: with Improved Camera's near plane lowered (or `fNearDistance` set low), look at far mountains from a high place; with it on, landscape LOD no longer pokes through them as the camera turns.
 - Send back `reversed-z.log` and `skyrim-runtime-extender.log` with anything that looks wrong.
 
