@@ -307,6 +307,14 @@ creation_hook!(create_vertex, CREATE_VERTEX);
 creation_hook!(create_pixel, CREATE_PIXEL);
 creation_hook!(create_domain, CREATE_DOMAIN);
 
+/// A cached shader's twin (the shader itself where it has none) and constant slot, without a
+/// reference taken: the cache holds the shader, and the shader its twin.
+pub(crate) fn settled(shader: *mut c_void) -> Option<(*mut c_void, Option<u32>)> {
+    let resolved = RESOLVED.lock().unwrap();
+    let found = resolved.as_ref()?.get(&(shader as usize))?;
+    Some((found.twin.map_or(shader, |twin| twin as *mut c_void), found.slot))
+}
+
 fn bytecode(shader: &ID3D11DeviceChild) -> Option<Vec<u8>> {
     let mut size = 0;
     unsafe { shader.GetPrivateData(&BYTECODE, &raw mut size, None) }.ok()?;

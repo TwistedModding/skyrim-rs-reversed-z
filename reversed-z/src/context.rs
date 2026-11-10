@@ -878,6 +878,9 @@ fn domain_shader(shader: *mut c_void) -> *mut c_void {
     if !BOUND.load(Ordering::Relaxed) || shader.is_null() {
         return shader;
     }
+    if let Some((twin, _)) = crate::shader::settled(shader) {
+        return twin;
+    }
     let original = unsafe { ID3D11DomainShader::from_raw_borrowed(&shader) }.unwrap();
     crate::shader::domain(original).map_or(shader, |twin| twin.as_raw())
 }
@@ -907,6 +910,9 @@ unsafe extern "system" fn set_domain_shader(
 fn pixel_shader(shader: *mut c_void) -> *mut c_void {
     if !BOUND.load(Ordering::Relaxed) || shader.is_null() {
         return shader;
+    }
+    if let Some((twin, _)) = crate::shader::settled(shader) {
+        return twin;
     }
     let original = unsafe { ID3D11PixelShader::from_raw_borrowed(&shader) }.unwrap();
     crate::shader::pixel(original).map_or(shader, |twin| twin.as_raw())
@@ -1514,6 +1520,10 @@ fn viewports(given: &[D3D11_VIEWPORT]) -> Viewports {
 fn vertex_shader(shader: *mut c_void) -> *mut c_void {
     if !BOUND.load(Ordering::Relaxed) || shader.is_null() {
         return shader;
+    }
+    if let Some((twin, slot)) = crate::shader::settled(shader) {
+        VERTEX_CONSTANT_SLOT.store(slot.unwrap_or(u32::MAX), Ordering::Relaxed);
+        return twin;
     }
     let original = unsafe { ID3D11VertexShader::from_raw_borrowed(&shader) }.unwrap();
     let twin = crate::shader::mirrored(original, || {
