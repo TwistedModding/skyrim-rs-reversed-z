@@ -109,7 +109,7 @@ type CubeMapCamera = unsafe extern "C" fn(usize, usize, usize, usize) -> usize;
 fn keep_cube_map_far(host: &'static Host) -> Result<(), String> {
     // looked up without a manifest record: a runtime that cannot place it keeps its own far plane
     let at = skyrim::reloc()
-        .location(fns::Msg_ClearLists_sub0_sub1_sub5)
+        .location(fns::TESWaterReflections__UpdateCubeMap)
         .map_err(|e| e.to_string())?;
     host.hooks()
         .around(
