@@ -695,16 +695,25 @@ mod tests {
         let holds = [(held("1.0"), 1.0f32), (held("(1.0 - 16.0 / 16777216.0)"), inside)];
         let unpushed = ROWS.replace("o.z += 0.5 * saturate((o.z - 70000.0) * 0.0001);", "");
         assert_ne!(unpushed, ROWS);
+        // clip z from a row worked out in the shader, as the land's is
+        let composed = ROWS
+            .replace("cbuffer view", "cbuffer object : register(b12) { float4 world; }\ncbuffer view")
+            .replace("dot(rows[2], p)", "dot(rows[2] * (world.x / 3.0), p)")
+            .replace("dot(rows[3], p)", "dot(rows[3] * (world.x / 3.0), p)");
+        assert_ne!(composed, ROWS);
+        let nudged = ROWS.replace("o.z += 0.5 * saturate((o.z - 70000.0) * 0.0001);", "o.z -= 0.25;");
         for source in [
             ROWS.to_owned(),
             holds[0].0.clone(),
             holds[1].0.clone(),
             occupied.clone(),
             unpushed.clone(),
+            nudged.clone(),
+            composed.clone(),
         ] {
             let code = compile(&source);
             for near in [2.0f32, 15.0] {
-                for distance in [51_720.0f32, 75_000.37, 90_000.0] {
+                for distance in [5_000.0f32, 51_720.0, 75_000.37, 90_000.0] {
                     let a = 350_000.0 / (350_000.0 - near);
                     let b = -a * near;
                     let projection = [a, b, 0.0, near / 15.0];
@@ -729,11 +738,16 @@ mod tests {
                         execute(&device, &context, &twin, &code, projection, slot, distance)
                     };
                     let reversed = run(distance);
-                    // a pushed shader's push is 0.5 at clip z 80,000 and in proportion elsewhere
+                    // the engine's push becomes a line from 16,384 to 0.5 at clip z 80,000, and
+                    // nothing nearer than its start for a row worked out in the shader; any other
+                    // addend is carried over, scaled as the engine's used to be
                     let push = if source == unpushed {
                         0.0
+                    } else if source == nudged {
+                        -0.25 * near / 15.0
                     } else {
-                        0.5 / 80_000.0 * (distance * a + b) * near / 15.0
+                        let line = 0.5 / (80_000.0 - 16_384.0) * (distance * a + b - 16_384.0);
+                        (if source == composed { line.max(0.0) } else { line }) * near / 15.0
                     };
                     let expected = f64::from(-b)
                         - f64::from(a - 1.0) * f64::from(distance)

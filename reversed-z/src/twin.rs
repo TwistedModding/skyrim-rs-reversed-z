@@ -11,8 +11,8 @@
 //! any near. The far push the engine adds after clip z is carried over, scaled by near / 15.
 //! The engine's push is a clamped ramp worked out per vertex, which a large triangle across the
 //! ramp interpolates wrongly (distant water against the seabed under it), so the twin gives a
-//! push in proportion to clip z in its place: linear, so every triangle interpolates it exactly,
-//! and still behind the rest.
+//! push that grows evenly with clip z in its place, from past the loaded cells: water's is a line
+//! every triangle interpolates exactly, land's the same line and nothing nearer than its start.
 //! An unused constant-buffer slot carries the projection and scale. Otherwise (screen quads, constant
 //! depth, the sky's z = w) the shader ends with z = w - z.
 
@@ -359,14 +359,42 @@ struct ClipZ {
     component: u8,
     /// z reads the w row too (a z held at w, where the w row is the only row w reads).
     held: bool,
-    /// The instruction that adds the far push to standard z, when only moves and minimums follow
-    /// it on the way to the position.
-    push: Option<usize>,
+    /// The instruction that adds the far push to standard z and the destination component it adds
+    /// it in, when only moves and minimums follow it on the way to the position.
+    push: Option<(usize, u8)>,
+    /// What is added is the engine's far push (its ramp starts from z - 70000).
+    ramp: bool,
+    /// The leaf reads the z row itself, not a row worked out from it.
+    direct: bool,
 }
 
-/// The engine's push at the end of its ramp over the clip z there: the push per unit of clip z
-/// that meets the engine's at 80,000.
-const LINEAR_PUSH: f32 = 0.5 / 80_000.0;
+const RAMP_START: f32 = 70_000.0;
+
+/// The push that takes the ramp's place starts here, past the loaded cells, and meets the
+/// engine's 0.5 at 80,000: nothing drawn nearer is moved against a pass that draws it unpushed.
+const PUSH_START: f32 = 16_384.0;
+const PUSH_SLOPE: f32 = 0.5 / (80_000.0 - PUSH_START);
+
+/// The push in place of the engine's ramp, negated into `KEPT.y`. Where clip z is one dot with a
+/// row of the shader's own buffer (water, in triangles of any size) it is a line through
+/// `PUSH_START`, which every triangle interpolates exactly and which is a little forward of the
+/// rest nearer than that; elsewhere (land, cut finely) it is nothing nearer than that.
+fn even_push(base: u32, slot: u32, direct: bool) -> Vec<(u32, Vec<Vec<u32>>)> {
+    let to = || reg(TEMP, base + KEPT, Some(1 << 1), XYZW, false);
+    let from = |c: u8| reg(TEMP, base + KEPT, None, [c; 4], false);
+    let number = |v: f32| vec![1 | (IMMEDIATE32 << 12), v.to_bits()];
+    let mut steps = vec![(ADD, vec![to(), from(0), number(-PUSH_START)])];
+    if !direct {
+        steps.push((MAX, vec![to(), from(1), number(0.0)]));
+    }
+    steps.push((MUL, vec![to(), from(1), number(-PUSH_SLOPE)]));
+    // an orthographic view's clip z never reached the engine's ramp
+    steps.push((
+        MOVC,
+        vec![to(), cb(slot, 0, 3, false), vec![2 | (IMMEDIATE32 << 12), 0, 0, 0, 0], from(1)],
+    ));
+    steps
+}
 
 /// The operand of an `add` or `mad` that is added to `(register, component)`, read unmodified.
 fn addend_to(ins: &Instruction, hit: u8, register: u32, component: u8) -> Option<usize> {
@@ -384,7 +412,7 @@ fn addend_to(ins: &Instruction, hit: u8, register: u32, component: u8) -> Option
     }
 }
 
-fn clip_z(code: &[Instruction], position: u32) -> Option<ClipZ> {
+fn clip_z(tok: &[u32], code: &[Instruction], position: u32) -> Option<ClipZ> {
     let (z_slice, z_rows) = slice(code, position, 2)?;
     let (_, w_rows) = slice(code, position, 3)?;
     let mut z_only = z_rows.difference(&w_rows);
@@ -434,6 +462,8 @@ fn clip_z(code: &[Instruction], position: u32) -> Option<ClipZ> {
                         component: components(hit).next()?,
                         held,
                         push: None,
+                        ramp: false,
+                        direct: ins.operands[1..].iter().any(|s| s.element() == Some(z_row)),
                     });
                 } else if let Some(z) = &mut leaf {
                     let d = &code[z.leaf].operands[0];
@@ -445,8 +475,12 @@ fn clip_z(code: &[Instruction], position: u32) -> Option<ClipZ> {
                                 && writer.get(&(*r, z.component)) == Some(&z.leaf)
                         })
                         .and_then(|r| addend_to(ins, hit, r, z.component));
-                    if addend.is_some() {
-                        z.push = Some(n);
+                    if let Some(k) = addend {
+                        let o = &ins.operands[k];
+                        z.ramp |= ins.op == ADD
+                            && o.kind == IMMEDIATE32
+                            && tok[o.start + 1..o.end].contains(&(-RAMP_START).to_bits());
+                        z.push = Some((n, hit));
                     } else if !matches!(ins.op, MOV | MIN) {
                         z.push = None;
                     }
@@ -495,8 +529,8 @@ fn keep_push(
     base: u32,
     standard: u32,
     c: u8,
+    mask: u8,
 ) -> Option<(Vec<u32>, u8)> {
-    let mask = ins.operands[0].mask?;
     let first = addend_to(ins, mask, standard, c)?;
     let to = reg(TEMP, base + PUSH, Some(mask), XYZW, false);
     let source = |k: usize| &tok[ins.operands[k].start..ins.operands[k].end];
@@ -524,6 +558,8 @@ fn precise(
         component: c,
         held,
         push,
+        ramp,
+        direct,
     }: ClipZ,
 ) -> Option<(Inserted, Vec<u32>)> {
     let d = &code[leaf].operands[0];
@@ -540,25 +576,29 @@ fn precise(
     )]);
     let mut push_component = 0;
     let pushed = match push {
-        Some(n) => {
-            // only the held ending compares with the engine's own push
-            if held {
-                let (keep, component) = keep_push(tok, &code[n], base, standard, c)?;
+        Some((n, mask)) => {
+            // the engine's ramp gives way to the linear push; anything else a shader adds to
+            // clip z is carried over as it is, and the held ending compares with either
+            if held || !ramp {
+                let (keep, component) = keep_push(tok, &code[n], base, standard, c, mask)?;
                 push_component = component;
                 after.entry(n - 1).or_default().extend(keep);
             }
-            let per_z = vec![1 | (IMMEDIATE32 << 12), (-LINEAR_PUSH).to_bits()];
-            (MUL, vec![kept(1), temp(KEPT, 0, false), per_z])
+            if ramp {
+                even_push(base, slot, direct)
+            } else {
+                vec![(MOV, vec![kept(1), temp(PUSH, push_component, true)])]
+            }
         }
-        None => (
+        None => vec![(
             ADD,
             vec![kept(1), temp(KEPT, 0, false), temp(POSITION, 2, true)],
-        ),
+        )],
     };
     let position_z = reg(OUTPUT, position, Some(0b0100), XYZW, false);
     let sum = |to: Vec<u32>| (ADD, vec![to, temp(KEPT, 2, false), temp(KEPT, 1, false)]);
-    let mut steps = vec![
-        pushed,
+    let mut steps = pushed;
+    steps.extend([
         (
             MUL,
             vec![kept(1), temp(KEPT, 1, false), cb(slot, 0, 0, false)],
@@ -586,7 +626,7 @@ fn precise(
                 temp(KEPT, 2, false),
             ],
         ),
-    ];
+    ]);
     if held {
         steps.push(sum(kept(2)));
         steps.extend(held_ending(base, position_z, push_component));
@@ -716,9 +756,11 @@ fn rewrite_position(container: &[u8], precise_allowed: bool) -> Option<Mirrored>
     );
     let mut constants = None;
     // a held z is told from the pushed one by the kept push
-    let found = clip_z(&code, position)
+    let found = clip_z(&tok, &code, position)
         .filter(|z| precise_allowed && (!z.held || z.push.is_some()));
-    let held = found.as_ref().is_some_and(|z| z.held);
+    let keeps_push = found
+        .as_ref()
+        .is_some_and(|z| z.held || (z.push.is_some() && !z.ramp));
     let after = if let Some(leaf) = found {
         let slot = (0..14).rev().find(|&slot| {
             !code
@@ -740,7 +782,7 @@ fn rewrite_position(container: &[u8], precise_allowed: bool) -> Option<Mirrored>
         ));
         HashMap::new()
     };
-    let extra = if after.is_empty() { 1 } else { 2 + u32::from(held) };
+    let extra = if after.is_empty() { 1 } else { 2 + u32::from(keeps_push) };
 
     let mut declared = after.is_empty();
     let mut out = tok[..2].to_vec();
