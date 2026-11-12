@@ -414,17 +414,17 @@ fn resolve<S: Interface + core::ops::Deref<Target = ID3D11DeviceChild>>(
         if slot == UNCHANGED {
             return Some((shader.clone(), None));
         }
+        let slot = (slot != NO_CONSTANTS).then_some(slot);
         let mut twin: *mut c_void = core::ptr::null_mut();
         size = 8;
-        unsafe { shader.GetPrivateData(&TWIN, &raw mut size, Some((&raw mut twin).cast())) }
-            .ok()?;
-        if twin.is_null() {
-            return None;
+        // only a twin carries a slot without a twin of its own: D3D11 hands it back when it rebinds
+        // the bound shader during Present
+        if unsafe { shader.GetPrivateData(&TWIN, &raw mut size, Some((&raw mut twin).cast())) }
+            .is_err()
+        {
+            return Some((shader.clone(), slot));
         }
-        return Some((
-            unsafe { S::from_raw(twin) },
-            (slot != NO_CONSTANTS).then_some(slot),
-        ));
+        return (!twin.is_null()).then(|| (unsafe { S::from_raw(twin) }, slot));
     }
     let Some(code) = bytecode(shader).or_else(fallback) else {
         if MISSED.fetch_add(1, Ordering::Relaxed) == 0 {
@@ -473,6 +473,8 @@ fn resolve<S: Interface + core::ops::Deref<Target = ID3D11DeviceChild>>(
             return None;
         }
         let twin = unsafe { S::from_raw(twin) };
+        let own = rewritten.constants.unwrap_or(NO_CONSTANTS);
+        unsafe { twin.SetPrivateData(&CONSTANTS, 4, Some((&raw const own).cast())) }.ok()?;
         let child: &ID3D11DeviceChild = shader;
         let key = TWIN;
         unsafe {
@@ -733,6 +735,9 @@ mod tests {
                     let cached = mirrored(&original, || panic!("cached twin")).unwrap();
                     assert_eq!(cached.0.as_raw(), twin.as_raw());
                     drop(cached);
+                    let rebound = mirrored(&twin, || panic!("a twin is its own twin")).unwrap();
+                    assert_eq!((rebound.0.as_raw(), rebound.1), (twin.as_raw(), slot));
+                    drop(rebound);
                     drop(original);
                     let run = |distance| {
                         execute(&device, &context, &twin, &code, projection, slot, distance)
