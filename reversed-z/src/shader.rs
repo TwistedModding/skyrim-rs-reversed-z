@@ -91,7 +91,9 @@ static RESOLVED: Mutex<Option<PointerMap<Resolved>>> = Mutex::new(None);
 /// data (a translation layer). Each entry holds a reference, so the pointer cannot be reused.
 static STORE: Mutex<Option<std::collections::HashMap<usize, (ID3D11DeviceChild, Vec<u8>)>>> =
     Mutex::new(None);
-static READBACK_LOGGED: AtomicU64 = AtomicU64::new(0);
+static READBACK_CHECKS: AtomicU64 = AtomicU64::new(0);
+/// Set when a shader's private data cannot be read back; the store is used only then.
+static PRIVATE_DATA_BROKEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// Cached shaders past this many are released and looked up again.
 const RESOLVED_LIMIT: usize = 1 << 14;
 
@@ -331,19 +333,27 @@ macro_rules! creation_hook {
                     }
                     Err(e) => crate::log(&format!("shader bytecode capture failed: {e}")),
                 }
-                let bytes = unsafe { core::slice::from_raw_parts(code.cast::<u8>(), size as usize) };
-                STORE
-                    .lock()
-                    .unwrap()
-                    .get_or_insert_with(Default::default)
-                    .insert(shader.as_raw() as usize, (shader.clone(), bytes.to_vec()));
-                if READBACK_LOGGED.fetch_add(1, Ordering::Relaxed) < 3 {
+                if !PRIVATE_DATA_BROKEN.load(Ordering::Relaxed)
+                    && READBACK_CHECKS.fetch_add(1, Ordering::Relaxed) < 3
+                {
                     let mut got = 0;
                     let read = unsafe { shader.GetPrivateData(&BYTECODE, &raw mut got, None) };
-                    crate::log(&format!(
-                        "capture check: wrote {size} bytes, GetPrivateData size query {:?} (size {got})",
-                        read.as_ref().map(|_| ()).map_err(|e| e.code())
-                    ));
+                    if let Err(e) = read {
+                        PRIVATE_DATA_BROKEN.store(true, Ordering::Relaxed);
+                        crate::log(&format!(
+                            "shader private data is not returned ({}); keeping bytecode in a side store",
+                            e.code()
+                        ));
+                    }
+                }
+                if PRIVATE_DATA_BROKEN.load(Ordering::Relaxed) {
+                    let bytes =
+                        unsafe { core::slice::from_raw_parts(code.cast::<u8>(), size as usize) };
+                    STORE
+                        .lock()
+                        .unwrap()
+                        .get_or_insert_with(Default::default)
+                        .insert(shader.as_raw() as usize, (shader.clone(), bytes.to_vec()));
                 }
             }
             result
