@@ -86,6 +86,12 @@ struct Resolved {
 }
 
 static RESOLVED: Mutex<Option<PointerMap<Resolved>>> = Mutex::new(None);
+
+/// Bytecode by shader pointer, for a D3D11 whose shader objects do not give back their private
+/// data (a translation layer). Each entry holds a reference, so the pointer cannot be reused.
+static STORE: Mutex<Option<std::collections::HashMap<usize, (ID3D11DeviceChild, Vec<u8>)>>> =
+    Mutex::new(None);
+static READBACK_LOGGED: AtomicU64 = AtomicU64::new(0);
 /// Cached shaders past this many are released and looked up again.
 const RESOLVED_LIMIT: usize = 1 << 14;
 
@@ -132,8 +138,21 @@ pub(crate) fn system_d3d11() -> Option<HMODULE> {
 /// A WARP device of the system's D3D11 and its immediate context. Every device of that D3D11,
 /// hardware or not, shares their tables, so hooks taken from them sit below any wrapper's.
 pub(crate) fn system_device() -> Option<(ID3D11Device, ID3D11DeviceContext)> {
+    match system_device_checked() {
+        Ok(pair) => Some(pair),
+        Err(e) => {
+            crate::log(&format!("system D3D11 device: {e}"));
+            None
+        }
+    }
+}
+
+fn system_device_checked() -> Result<(ID3D11Device, ID3D11DeviceContext), String> {
+    let module = system_d3d11().ok_or("the system's d3d11.dll did not load")?;
     let create: CreateDeviceFn = unsafe {
-        core::mem::transmute(GetProcAddress(system_d3d11()?, s!("D3D11CreateDevice"))?)
+        core::mem::transmute(
+            GetProcAddress(module, s!("D3D11CreateDevice")).ok_or("no D3D11CreateDevice export")?,
+        )
     };
     let (mut device, mut context) = (core::ptr::null_mut(), core::ptr::null_mut());
     unsafe {
@@ -151,19 +170,33 @@ pub(crate) fn system_device() -> Option<(ID3D11Device, ID3D11DeviceContext)> {
         )
     }
     .ok()
-    .ok()?;
+    .map_err(|e| format!("D3D11CreateDevice(WARP) failed: {e}"))?;
     let device = (!device.is_null()).then(|| unsafe { ID3D11Device::from_raw(device) });
     let context = (!context.is_null()).then(|| unsafe { ID3D11DeviceContext::from_raw(context) });
-    Some((device?, context?))
+    Ok((device.ok_or("no device returned")?, context.ok_or("no context returned")?))
+}
+
+/// The d3d11.dll the game itself imported, when the system's cannot make a device here (a
+/// translation layer such as CrossOver's, which has no WARP): its creation functions are hooked
+/// the way DXVK's are, before the game makes its device.
+fn loaded_d3d11() -> Option<HMODULE> {
+    unsafe { GetModuleHandleW(w!("d3d11.dll")) }.ok()
 }
 
 /// Hooks shader creation where every draw finally lands: on the system's D3D11 below any wrapper
 /// (ENB, a proxy), whose device makes the shaders the context later binds, or at device
 /// creation on DXVK's D3D11 when Community Shaders loaded it.
 pub(crate) fn install() -> Result<(), String> {
-    let Some(module) = dxvk() else {
-        let (device, _) = system_device().ok_or("no system D3D11 device")?;
-        return install_device(&device);
+    let module = match dxvk() {
+        Some(module) => module,
+        None => match system_device() {
+            Some((device, _)) => return install_device(&device),
+            None => {
+                let module = loaded_d3d11().ok_or("no system D3D11 device and no d3d11.dll loaded")?;
+                crate::log("shader capture: hooking the loaded d3d11.dll's device creation instead");
+                module
+            }
+        },
     };
     let device =
         unsafe { GetProcAddress(module, s!("D3D11CreateDevice")) }.ok_or("no D3D11CreateDevice")?;
@@ -298,6 +331,20 @@ macro_rules! creation_hook {
                     }
                     Err(e) => crate::log(&format!("shader bytecode capture failed: {e}")),
                 }
+                let bytes = unsafe { core::slice::from_raw_parts(code.cast::<u8>(), size as usize) };
+                STORE
+                    .lock()
+                    .unwrap()
+                    .get_or_insert_with(Default::default)
+                    .insert(shader.as_raw() as usize, (shader.clone(), bytes.to_vec()));
+                if READBACK_LOGGED.fetch_add(1, Ordering::Relaxed) < 3 {
+                    let mut got = 0;
+                    let read = unsafe { shader.GetPrivateData(&BYTECODE, &raw mut got, None) };
+                    crate::log(&format!(
+                        "capture check: wrote {size} bytes, GetPrivateData size query {:?} (size {got})",
+                        read.as_ref().map(|_| ()).map_err(|e| e.code())
+                    ));
+                }
             }
             result
         }
@@ -317,11 +364,20 @@ pub(crate) fn settled(shader: *mut c_void) -> Option<(*mut c_void, Option<u32>)>
 
 fn bytecode(shader: &ID3D11DeviceChild) -> Option<Vec<u8>> {
     let mut size = 0;
-    unsafe { shader.GetPrivateData(&BYTECODE, &raw mut size, None) }.ok()?;
-    let mut code = vec![0; size as usize];
-    unsafe { shader.GetPrivateData(&BYTECODE, &raw mut size, Some(code.as_mut_ptr().cast())) }
-        .ok()?;
-    Some(code)
+    if unsafe { shader.GetPrivateData(&BYTECODE, &raw mut size, None) }.is_ok() {
+        let mut code = vec![0; size as usize];
+        if unsafe { shader.GetPrivateData(&BYTECODE, &raw mut size, Some(code.as_mut_ptr().cast())) }
+            .is_ok()
+        {
+            return Some(code);
+        }
+    }
+    STORE
+        .lock()
+        .unwrap()
+        .as_ref()?
+        .get(&(shader.as_raw() as usize))
+        .map(|(_, code)| code.clone())
 }
 
 pub(crate) fn mirrored(
