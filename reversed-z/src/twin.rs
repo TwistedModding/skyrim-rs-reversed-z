@@ -11,8 +11,8 @@
 //! any near. The far push the engine adds after clip z is carried over, scaled by near / 15.
 //! The engine's push is a clamped ramp worked out per vertex, which a large triangle across the
 //! ramp interpolates wrongly (distant water against the seabed under it), so the twin gives a
-//! push that grows evenly with clip z in its place, from past the loaded cells: water's is a line
-//! every triangle interpolates exactly, land's the same line and nothing nearer than its start.
+//! push that grows evenly with clip z in its place, from past the loaded cells, and nothing
+//! nearer than its start: water there stays under the foam and ripples drawn on it.
 //! An unused constant-buffer slot carries the projection and scale. Otherwise (screen quads, constant
 //! depth, the sky's z = w) the shader ends with z = w - z.
 
@@ -364,8 +364,6 @@ struct ClipZ {
     push: Option<(usize, u8)>,
     /// What is added is the engine's far push (its ramp starts from z - 70000).
     ramp: bool,
-    /// The leaf reads the z row itself, not a row worked out from it.
-    direct: bool,
 }
 
 const RAMP_START: f32 = 70_000.0;
@@ -375,25 +373,22 @@ const RAMP_START: f32 = 70_000.0;
 const PUSH_START: f32 = 16_384.0;
 const PUSH_SLOPE: f32 = 0.5 / (80_000.0 - PUSH_START);
 
-/// The push in place of the engine's ramp, negated into `KEPT.y`. Where clip z is one dot with a
-/// row of the shader's own buffer (water, in triangles of any size) it is a line through
-/// `PUSH_START`, which every triangle interpolates exactly and which is a little forward of the
-/// rest nearer than that; elsewhere (land, cut finely) it is nothing nearer than that.
-fn even_push(base: u32, slot: u32, direct: bool) -> Vec<(u32, Vec<Vec<u32>>)> {
+/// The push in place of the engine's ramp, negated into `KEPT.y`: a line from `PUSH_START` and
+/// nothing nearer than that.
+fn even_push(base: u32, slot: u32) -> [(u32, Vec<Vec<u32>>); 4] {
     let to = || reg(TEMP, base + KEPT, Some(1 << 1), XYZW, false);
     let from = |c: u8| reg(TEMP, base + KEPT, None, [c; 4], false);
     let number = |v: f32| vec![1 | (IMMEDIATE32 << 12), v.to_bits()];
-    let mut steps = vec![(ADD, vec![to(), from(0), number(-PUSH_START)])];
-    if !direct {
-        steps.push((MAX, vec![to(), from(1), number(0.0)]));
-    }
-    steps.push((MUL, vec![to(), from(1), number(-PUSH_SLOPE)]));
-    // an orthographic view's clip z never reached the engine's ramp
-    steps.push((
-        MOVC,
-        vec![to(), cb(slot, 0, 3, false), vec![2 | (IMMEDIATE32 << 12), 0, 0, 0, 0], from(1)],
-    ));
-    steps
+    [
+        (ADD, vec![to(), from(0), number(-PUSH_START)]),
+        (MAX, vec![to(), from(1), number(0.0)]),
+        (MUL, vec![to(), from(1), number(-PUSH_SLOPE)]),
+        // an orthographic view's clip z never reached the engine's ramp
+        (
+            MOVC,
+            vec![to(), cb(slot, 0, 3, false), vec![2 | (IMMEDIATE32 << 12), 0, 0, 0, 0], from(1)],
+        ),
+    ]
 }
 
 /// The operand of an `add` or `mad` that is added to `(register, component)`, read unmodified.
@@ -463,7 +458,6 @@ fn clip_z(tok: &[u32], code: &[Instruction], position: u32) -> Option<ClipZ> {
                         held,
                         push: None,
                         ramp: false,
-                        direct: ins.operands[1..].iter().any(|s| s.element() == Some(z_row)),
                     });
                 } else if let Some(z) = &mut leaf {
                     let d = &code[z.leaf].operands[0];
@@ -559,7 +553,6 @@ fn precise(
         held,
         push,
         ramp,
-        direct,
     }: ClipZ,
 ) -> Option<(Inserted, Vec<u32>)> {
     let d = &code[leaf].operands[0];
@@ -585,7 +578,7 @@ fn precise(
                 after.entry(n - 1).or_default().extend(keep);
             }
             if ramp {
-                even_push(base, slot, direct)
+                even_push(base, slot).into()
             } else {
                 vec![(MOV, vec![kept(1), temp(PUSH, push_component, true)])]
             }

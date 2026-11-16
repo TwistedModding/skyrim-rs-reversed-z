@@ -743,16 +743,16 @@ mod tests {
                         execute(&device, &context, &twin, &code, projection, slot, distance)
                     };
                     let reversed = run(distance);
-                    // the engine's push becomes a line from 16,384 to 0.5 at clip z 80,000, and
-                    // nothing nearer than its start for a row worked out in the shader; any other
-                    // addend is carried over, scaled as the engine's used to be
+                    // the engine's push becomes a line from 16,384 to 0.5 at clip z 80,000 and
+                    // nothing nearer than its start; any other addend is carried over, scaled as
+                    // the engine's used to be
                     let push = if source == unpushed {
                         0.0
                     } else if source == nudged {
                         -0.25 * near / 15.0
                     } else {
                         let line = 0.5 / (80_000.0 - 16_384.0) * (distance * a + b - 16_384.0);
-                        (if source == composed { line.max(0.0) } else { line }) * near / 15.0
+                        line.max(0.0) * near / 15.0
                     };
                     let expected = f64::from(-b)
                         - f64::from(a - 1.0) * f64::from(distance)
