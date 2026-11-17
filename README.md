@@ -24,6 +24,8 @@ Install the package with a mod manager, or copy its `SKSE` folder into the game'
 
 Experimental support for stock Community Shaders 1.9.1 requires no CS patches. D3D11 WARP tests and in-game smoke tests cover Terrain Blending 1.2.0, Upscaling 1.4.0, distant mountains, Riverwood, first-person hands and the Sleeping Giant Inn. The tested paths reported no shader rewrite failures, missing bytecode or unsupported depth copies. Other feature combinations and DLSS modes have not been validated.
 
+Community Shaders' development builds (checked against its `dev` branch of 2026-11-16) batch the grass and move distant trees in the wind. Both are drawn with the same far-depth precision as the rest of the world, and so is the game's own grass. Checked on the shaders such a build compiles, not yet in game.
+
 With RS Improved Camera and CS, use the Skyrim Runtime Extender loader with API 5 or newer (reported in `skyrim-runtime-extender.log`). Hook chaining is the default and preserves IC body-part hiding without an INI change. An explicit `compat = refuse` setting disables chaining globally. Earlier loaders require `compat = stack` in `Data\SKSE\Plugins\skyrim-runtime-extender.ini`.
 
 With the Community Shaders test build that runs the game on DXVK and draws the world through Drawcall Limit Fix, the plugin also mirrors DCLF's own Vulkan renderings into the world depth targets (`reversed-z.log` says `vulkan: 3 world images on DXVK's device`). DCLF's occlusion culling and its far-depth precision are not yet covered; the console line reports the Vulkan counters.

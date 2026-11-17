@@ -521,7 +521,7 @@ pub(crate) fn counters() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::twin::tests::{CONSTANT, ROWS, compile, compile_stage, held, occupied_slots};
+    use crate::twin::tests::{CONSTANT, ROWS, compile, compile_stage, early, held, occupied_slots};
     use windows::Win32::Graphics::Direct3D::{
         D3D_DRIVER_TYPE_WARP, D3D_PRIMITIVE_TOPOLOGY_POINTLIST,
     };
@@ -712,6 +712,8 @@ mod tests {
             unpushed.clone(),
             nudged.clone(),
             composed.clone(),
+            early(true),
+            early(false),
         ] {
             let code = compile(&source);
             for near in [2.0f32, 15.0] {

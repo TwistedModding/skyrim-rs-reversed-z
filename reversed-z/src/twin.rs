@@ -24,10 +24,12 @@ const DIV: u32 = 14;
 const DP2: u32 = 15;
 const DP3: u32 = 16;
 const DP4: u32 = 17;
+const ELSE: u32 = 18;
 const ENDIF: u32 = 21;
 const ENDLOOP: u32 = 22;
 const ENDSWITCH: u32 = 23;
 const IF: u32 = 31;
+const IMUL: u32 = 38;
 const LOOP: u32 = 48;
 const LT: u32 = 49;
 const MAD: u32 = 50;
@@ -40,6 +42,9 @@ const MUL: u32 = 56;
 const RET: u32 = 62;
 const RETC: u32 = 63;
 const SWITCH: u32 = 76;
+const SINCOS: u32 = 77;
+const UDIV: u32 = 78;
+const UMUL: u32 = 81;
 const DCL_CONSTANT_BUFFER: u32 = 89;
 const DCL_GLOBAL_FLAGS: u32 = 106;
 const DCL_OUTPUT_SIV: u32 = 103;
@@ -300,33 +305,79 @@ fn instruction(op: u32, operands: &[&[u32]]) -> Vec<u32> {
 /// destination components it contributes, and the constant-buffer elements it reads.
 type Slice = (BTreeMap<usize, u8>, BTreeSet<(u32, u32)>);
 
-fn slice(code: &[Instruction], position: u32, comp: u8) -> Option<Slice> {
+/// An instruction's destinations and its sources: the sine and cosine, the quotient and remainder
+/// and the two halves of a product are written by one instruction.
+fn written_and_read(ins: &Instruction) -> (&[Operand], &[Operand]) {
+    let written = if matches!(ins.op, IMUL | SINCOS | UDIV | UMUL) { 2 } else { 1 };
+    ins.operands.split_at(written.min(ins.operands.len()))
+}
+
+/// The program as the straight runs it can take, each by its instructions: a top-level `if`
+/// without an `else` whose body ends in a return is a run of its own (what comes before it, then
+/// its body), and the program goes on as if it were not there.
+fn runs(code: &[Instruction]) -> Vec<Vec<usize>> {
+    let returning = |start: usize| {
+        let mut depth = 0u32;
+        for (n, ins) in code.iter().enumerate().skip(start + 1) {
+            match ins.op {
+                IF | LOOP | SWITCH => depth += 1,
+                ELSE if depth == 0 => return None,
+                ENDIF if depth == 0 => return (code[n - 1].op == RET).then_some(n),
+                ENDIF | ENDLOOP | ENDSWITCH => depth = depth.checked_sub(1)?,
+                _ => {}
+            }
+        }
+        None
+    };
+    let mut runs = Vec::new();
+    let mut run = Vec::new();
+    let mut depth = 0u32;
+    let mut n = 0;
+    while n < code.len() {
+        if depth == 0
+            && code[n].op == IF
+            && let Some(end) = returning(n)
+        {
+            runs.push(run.iter().copied().chain(n + 1..end).collect());
+            n = end + 1;
+            continue;
+        }
+        match code[n].op {
+            IF | LOOP | SWITCH => depth += 1,
+            ENDIF | ENDLOOP | ENDSWITCH => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        run.push(n);
+        n += 1;
+    }
+    runs.push(run);
+    runs
+}
+
+fn slice(code: &[Instruction], run: &[usize], position: u32, comp: u8) -> Option<Slice> {
     let mut need: HashSet<(u32, u32, u8)> = HashSet::from([(OUTPUT, position, comp)]);
     let mut members = BTreeMap::new();
     let mut rows = BTreeSet::new();
-    for (n, ins) in code.iter().enumerate().rev() {
-        let Some(d) = ins.operands.first() else {
-            continue;
-        };
-        let (Some(mask), Some(r)) = (d.mask, d.register()) else {
-            continue;
-        };
-        if d.kind != TEMP && d.kind != OUTPUT {
-            continue;
+    for &n in run.iter().rev() {
+        let ins = &code[n];
+        let (written, read) = written_and_read(ins);
+        let mut hit = 0u8;
+        for d in written {
+            if let (Some(mask), Some(r), TEMP | OUTPUT) = (d.mask, d.register(), d.kind) {
+                for c in components(mask) {
+                    if need.remove(&(d.kind, r, c)) {
+                        hit |= 1 << c;
+                    }
+                }
+            }
         }
-        let hit: u8 = components(mask)
-            .filter(|&c| need.contains(&(d.kind, r, c)))
-            .fold(0, |m, c| m | 1 << c);
         if hit == 0 {
             continue;
         }
-        for c in components(hit) {
-            need.remove(&(d.kind, r, c));
-        }
         members.insert(n, hit);
-        rows.extend(ins.operands[1..].iter().filter_map(Operand::element));
+        rows.extend(read.iter().filter_map(Operand::element));
         for c in components(hit) {
-            for s in &ins.operands[1..] {
+            for s in read {
                 match s.kind {
                     IMMEDIATE32 | IMMEDIATE64 | CONSTANT_BUFFER | INPUT | SAMPLER | RESOURCE
                     | IMMEDIATE_CONSTANT_BUFFER | NULL => {}
@@ -351,9 +402,10 @@ const POSITION: u32 = 0;
 const KEPT: u32 = 1;
 const PUSH: u32 = 2;
 
-/// The last dot product of position z that depends on the z row of a matrix whose w row position w
-/// reads (standard clip z) and the component it writes. None where clip z is computed, or the
-/// shader returns, inside a branch or a loop: the twin's ending needs the kept z on every path.
+/// The last dot product of position z in a run that depends on the z row of a matrix whose w row
+/// position w reads (standard clip z) and the component it writes. None where clip z is computed,
+/// or the run returns, inside a branch or a loop: the twin's ending needs the kept z on every path.
+#[derive(PartialEq)]
 struct ClipZ {
     leaf: usize,
     component: u8,
@@ -407,9 +459,9 @@ fn addend_to(ins: &Instruction, hit: u8, register: u32, component: u8) -> Option
     }
 }
 
-fn clip_z(tok: &[u32], code: &[Instruction], position: u32) -> Option<ClipZ> {
-    let (z_slice, z_rows) = slice(code, position, 2)?;
-    let (_, w_rows) = slice(code, position, 3)?;
+fn clip_z(tok: &[u32], code: &[Instruction], run: &[usize], position: u32) -> Option<ClipZ> {
+    let (z_slice, z_rows) = slice(code, run, position, 2)?;
+    let (_, w_rows) = slice(code, run, position, 3)?;
     let mut z_only = z_rows.difference(&w_rows);
     let (Some(&z_row), None) = (z_only.next(), z_only.next()) else {
         return None;
@@ -427,7 +479,8 @@ fn clip_z(tok: &[u32], code: &[Instruction], position: u32) -> Option<ClipZ> {
     let mut dependent: BTreeSet<usize> = BTreeSet::new();
     let mut leaf: Option<ClipZ> = None;
     let mut depth = 0u32;
-    for (n, ins) in code.iter().enumerate() {
+    for &n in run {
+        let ins = &code[n];
         match ins.op {
             IF | LOOP | SWITCH => depth += 1,
             ENDIF | ENDLOOP | ENDSWITCH => depth = depth.checked_sub(1)?,
@@ -435,7 +488,7 @@ fn clip_z(tok: &[u32], code: &[Instruction], position: u32) -> Option<ClipZ> {
             _ => {}
         }
         if let Some(&hit) = z_slice.get(&n) {
-            let reads_row = ins.operands[1..].iter().any(|s| {
+            let reads_row = written_and_read(ins).1.iter().any(|s| {
                 s.element() == Some(z_row)
                     || (s.kind == TEMP
                         && s.register().is_some_and(|r| {
@@ -486,8 +539,8 @@ fn clip_z(tok: &[u32], code: &[Instruction], position: u32) -> Option<ClipZ> {
     leaf
 }
 
-/// Instructions inserted after given instructions of the program.
-type Inserted = HashMap<usize, Vec<u32>>;
+/// Instructions to insert, each after a given instruction of the program.
+type Inserted = Vec<(usize, Vec<u32>)>;
 
 /// The sum in `KEPT.z` written to the position, not below w less the shader's own z where the
 /// shader held that z under standard z plus the push (by more than rounding): a z held at or just
@@ -563,10 +616,10 @@ fn precise(
     };
     let temp = |r: u32, c: u8, negated: bool| reg(TEMP, base + r, None, [c; 4], negated);
     let kept = |c: u8| reg(TEMP, base + KEPT, Some(1 << c), XYZW, false);
-    let mut after = HashMap::from([(
+    let mut after = vec![(
         leaf,
         instruction(MOV, &[&kept(0), &reg(TEMP, standard, None, [c; 4], false)]),
-    )]);
+    )];
     let mut push_component = 0;
     let pushed = match push {
         Some((n, mask)) => {
@@ -575,7 +628,7 @@ fn precise(
             if held || !ramp {
                 let (keep, component) = keep_push(tok, &code[n], base, standard, c, mask)?;
                 push_component = component;
-                after.entry(n - 1).or_default().extend(keep);
+                after.push((n - 1, keep));
             }
             if ramp {
                 even_push(base, slot).into()
@@ -635,12 +688,11 @@ fn precise(
 }
 
 fn record_writes(writer: &mut HashMap<(u32, u8), usize>, ins: &Instruction, n: usize) {
-    if let Some(d) = ins.operands.first()
-        && d.kind == TEMP
-        && let (Some(mask), Some(r)) = (d.mask, d.register())
-    {
-        for c in components(mask) {
-            writer.insert((r, c), n);
+    for d in written_and_read(ins).0 {
+        if let (Some(mask), Some(r), TEMP) = (d.mask, d.register(), d.kind) {
+            for c in components(mask) {
+                writer.insert((r, c), n);
+            }
         }
     }
 }
@@ -716,6 +768,73 @@ pub(crate) fn mirrored_domain(container: &[u8]) -> Option<Mirrored> {
     rewrite_position(container, false)
 }
 
+/// What the precise runs of a twin add to it; nothing where no run is precise.
+#[derive(Default)]
+struct Additions {
+    /// The free constant-buffer slot the endings read the projection from.
+    constants: Option<u32>,
+    /// Instructions to insert after an instruction of the program.
+    after: HashMap<usize, Vec<Vec<u32>>>,
+    /// A precise run's ending, by its return.
+    endings: HashMap<usize, Vec<u32>>,
+    /// Temps used past the redirected position.
+    temps: u32,
+}
+
+/// The additions for every run with a standard clip z, or `None` where they cannot be written
+/// (no free constant slot).
+fn additions(tok: &[u32], code: &[Instruction], position: u32, base: u32) -> Option<Additions> {
+    let runs = runs(code);
+    // a held z is told from the pushed one by the kept push
+    let found: Vec<Option<ClipZ>> = runs
+        .iter()
+        .map(|run| {
+            clip_z(tok, code, run, position).filter(|z| {
+                (!z.held || z.push.is_some()) && run.last().is_some_and(|&n| code[n].op == RET)
+            })
+        })
+        .collect();
+    // what one run keeps where another passes too must be what that one keeps there
+    let own = found.iter().flatten().all(|z| {
+        runs.iter().zip(&found).all(|(run, theirs)| {
+            theirs.as_ref() == Some(z)
+                || ![Some(z.leaf), z.push.map(|(n, _)| n)]
+                    .iter()
+                    .flatten()
+                    .any(|n| run.contains(n))
+        })
+    });
+    if !own || found.iter().all(Option::is_none) {
+        return Some(Additions::default());
+    }
+    let slot = (0..14).rev().find(|&slot| {
+        !code
+            .iter()
+            .any(|ins| ins.op == DCL_CONSTANT_BUFFER && tok.get(ins.at + 2) == Some(&slot))
+    })?;
+    let keeps_push = found
+        .iter()
+        .flatten()
+        .any(|z| z.held || (z.push.is_some() && !z.ramp));
+    let mut added = Additions {
+        constants: Some(slot),
+        temps: 1 + u32::from(keeps_push),
+        ..Additions::default()
+    };
+    for (run, z) in runs.iter().zip(found) {
+        let Some(z) = z else { continue };
+        let (kept, ending) = precise(tok, code, position, base, slot, z)?;
+        for (n, words) in kept {
+            let at = added.after.entry(n).or_default();
+            if !at.contains(&words) {
+                at.push(words);
+            }
+        }
+        added.endings.insert(*run.last()?, ending);
+    }
+    Some(added)
+}
+
 #[allow(clippy::cast_possible_truncation)]
 fn rewrite_position(container: &[u8], precise_allowed: bool) -> Option<Mirrored> {
     let (offsets, at, tok) = program(container)?;
@@ -740,49 +859,34 @@ fn rewrite_position(container: &[u8], precise_allowed: bool) -> Option<Mirrored>
 
     let position_out = |mask: u8| reg(OUTPUT, position, Some(mask), XYZW, false);
     let temp = |r: u32, c: u8, negated: bool| reg(TEMP, base + r, None, [c; 4], negated);
-    let mut tail = instruction(
+    let position_back = instruction(
         MOV,
         &[
             &position_out(0b1011),
             &reg(TEMP, base + POSITION, None, XYZW, false),
         ],
     );
-    let mut constants = None;
-    // a held z is told from the pushed one by the kept push
-    let found = clip_z(&tok, &code, position)
-        .filter(|z| precise_allowed && (!z.held || z.push.is_some()));
-    let keeps_push = found
-        .as_ref()
-        .is_some_and(|z| z.held || (z.push.is_some() && !z.ramp));
-    let after = if let Some(leaf) = found {
-        let slot = (0..14).rev().find(|&slot| {
-            !code
-                .iter()
-                .any(|ins| ins.op == DCL_CONSTANT_BUFFER && tok.get(ins.at + 2) == Some(&slot))
-        })?;
-        let (after, ending) = precise(&tok, &code, position, base, slot, leaf)?;
-        constants = Some(slot);
-        tail.extend(ending);
-        after
+    let plain = instruction(
+        ADD,
+        &[
+            &position_out(0b0100),
+            &temp(POSITION, 3, false),
+            &temp(POSITION, 2, true),
+        ],
+    );
+    let added = if precise_allowed {
+        additions(&tok, &code, position, base)?
     } else {
-        tail.extend(instruction(
-            ADD,
-            &[
-                &position_out(0b0100),
-                &temp(POSITION, 3, false),
-                &temp(POSITION, 2, true),
-            ],
-        ));
-        HashMap::new()
+        Additions::default()
     };
-    let extra = if after.is_empty() { 1 } else { 2 + u32::from(keeps_push) };
+    let extra = 1 + added.temps;
 
-    let mut declared = after.is_empty();
+    let mut declared = added.constants.is_none();
     let mut out = tok[..2].to_vec();
     for (n, ins) in code.iter().enumerate() {
         let mut body = tok[ins.at..ins.at + ins.len].to_vec();
         if !declared && ins.op != DCL_GLOBAL_FLAGS && ins.op != DCL_CONSTANT_BUFFER {
-            out.extend([DCL_CONSTANT_BUFFER | (4 << 24), CB_XYZW, constants?, 1]);
+            out.extend([DCL_CONSTANT_BUFFER | (4 << 24), CB_XYZW, added.constants?, 1]);
             declared = true;
         }
         if temps.is_none() && n == first {
@@ -804,17 +908,16 @@ fn rewrite_position(container: &[u8], precise_allowed: bool) -> Option<Mirrored>
             body[s.end - ins.at - 1] = base + POSITION;
         }
         if ins.op == RET {
-            out.extend(&tail);
+            out.extend(&position_back);
+            out.extend(added.endings.get(&n).unwrap_or(&plain));
         }
         out.extend(body);
-        if let Some(a) = after.get(&n) {
-            out.extend(a);
-        }
+        out.extend(added.after.get(&n).into_iter().flatten().flatten());
     }
     out[1] = out.len() as u32;
     Some(Mirrored {
         code: rebuild(container, &offsets, at, tok.len(), &out),
-        constants,
+        constants: added.constants,
     })
 }
 
@@ -1103,6 +1206,27 @@ pub(crate) mod tests {
         )
     }
 
+    /// `ROWS` after a branch that works the same position out for itself and returns, taken or
+    /// not: Community Shaders' grass has a path for a single draw and one for a batch.
+    pub(crate) fn early(taken: bool) -> String {
+        let body = "o = float4(dot(rows[0], p), dot(rows[1], p), dot(rows[2], p), dot(rows[3], p));
+            fog = length(o.xyz);
+            o.z += 0.5 * saturate((o.z - 70000.0) * 0.0001);
+            return o;
+";
+        format!(
+            "cbuffer object : register(b12) {{ float4 world; }}
+            cbuffer view : register(b2) {{ float4 rows[4]; }}
+            float4 main(float4 p : POSITION, out float fog : FOG) : SV_Position {{
+                float4 o;
+                [branch] if (world.x {} 0.0) {{ p.xyz *= world.x / 3.0; {body} }}
+                {body}
+            }}
+",
+            if taken { '>' } else { '<' }
+        )
+    }
+
     fn bytes(blob: &ID3DBlob) -> Vec<u8> {
         unsafe {
             core::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize())
@@ -1241,6 +1365,40 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_position_moved_by_a_sine_and_its_cosine_is_precise() {
+        let source = format!(
+            "cbuffer view : register(b2) {{ float4 rows[4]; }}
+            float4 main(float4 p : POSITION) : SV_Position {{
+                float s, c;
+                sincos(p.x, s, c);
+                p.xy += float2(s, c);
+                return {DOTS};
+            }}
+"
+        );
+        let rewritten = super::mirrored(&compile(&source)).unwrap();
+        let twin = text(&rewritten.code);
+        assert!(
+            twin.lines().any(|l| l.starts_with("sincos r") && !l.contains("null")),
+            "one instruction must write both: {twin}"
+        );
+        assert_eq!(rewritten.constants, Some(13));
+    }
+
+    #[test]
+    fn each_returning_path_gets_its_own_precise_ending() {
+        let rewritten = super::mirrored(&compile(&early(true))).unwrap();
+        let twin = text(&rewritten.code);
+        let lines: Vec<&str> = twin.lines().map(str::trim).collect();
+        assert!(
+            lines.windows(2).any(|pair| pair == ["ret", "endif"]),
+            "the early return must survive compilation: {twin}"
+        );
+        assert_eq!(rewritten.constants, Some(13));
+        assert_eq!(twin.matches("cb13[0].zzzz").count(), 2, "{twin}");
+    }
+
+    #[test]
     fn clip_z_inside_a_branch_keeps_w_minus_z() {
         let source = format!(
             "cbuffer view : register(b2) {{ float4 rows[4]; float4 band; }}
@@ -1351,5 +1509,103 @@ pub(crate) mod tests {
             assert!(disassembly.contains(after), "{disassembly}");
             assert!(!disassembly.contains(before), "{disassembly}");
         }
+    }
+
+    /// Every compiled shader under the folder in `REVERSED_Z_SHADERS` (a shader cache, or the
+    /// containers of the game's archive), rewritten and created on WARP: per folder the vertex
+    /// twins made and the precise ones, with the shaders left on w - z or refused by name.
+    #[test]
+    #[ignore = "reads a shader cache from disk"]
+    fn shaders_on_disk() {
+        use windows::Win32::Foundation::HMODULE;
+        use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_WARP;
+        use windows::Win32::Graphics::Direct3D11::{
+            D3D11_CREATE_DEVICE_FLAG, D3D11_SDK_VERSION, D3D11CreateDevice,
+        };
+        let root = std::env::var("REVERSED_Z_SHADERS").expect("REVERSED_Z_SHADERS");
+        let mut device = None;
+        unsafe {
+            D3D11CreateDevice(
+                None,
+                D3D_DRIVER_TYPE_WARP,
+                HMODULE::default(),
+                D3D11_CREATE_DEVICE_FLAG(0),
+                None,
+                D3D11_SDK_VERSION,
+                Some(&raw mut device),
+                None,
+                None,
+            )
+        }
+        .unwrap();
+        let device = device.unwrap();
+        let mut folders = vec![std::path::PathBuf::from(root)];
+        let mut rejected = 0;
+        while let Some(folder) = folders.pop() {
+            let (mut vertex, mut precise, mut plain, mut pixel, mut pixel_twins) = (0, 0, 0, 0, 0);
+            let mut notes = Vec::new();
+            for entry in std::fs::read_dir(&folder).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    folders.push(path);
+                    continue;
+                }
+                let Ok(code) = std::fs::read(&path) else { continue };
+                if code.get(..4) != Some(b"DXBC") {
+                    continue;
+                }
+                let Some((_, _, tok)) = super::program(&code) else { continue };
+                let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                match tok[0] >> 16 {
+                    1 => {
+                        vertex += 1;
+                        match super::mirrored(&code) {
+                            Some(twin) => {
+                                if twin.constants.is_some() {
+                                    precise += 1;
+                                } else {
+                                    plain += 1;
+                                    notes.push(format!("plain {name}"));
+                                }
+                                if unsafe { device.CreateVertexShader(&twin.code, None, None) }
+                                    .is_err()
+                                {
+                                    rejected += 1;
+                                    notes.push(format!("REJECTED {name}"));
+                                }
+                            }
+                            None => notes.push(format!("no twin {name}")),
+                        }
+                    }
+                    0 => {
+                        pixel += 1;
+                        match super::pixel(&code) {
+                            Some(super::Pixel::Mirrored(twin)) => {
+                                pixel_twins += 1;
+                                if unsafe { device.CreatePixelShader(&twin.code, None, None) }
+                                    .is_err()
+                                {
+                                    rejected += 1;
+                                    notes.push(format!("REJECTED {name}"));
+                                }
+                            }
+                            Some(super::Pixel::Unchanged) => {}
+                            None => notes.push(format!("pixel refused {name}")),
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if vertex + pixel != 0 {
+                println!(
+                    "{}: vertex {vertex} (precise {precise}, plain {plain}), pixel {pixel} (twins {pixel_twins})",
+                    folder.display()
+                );
+                for note in notes {
+                    println!("    {note}");
+                }
+            }
+        }
+        assert_eq!(rejected, 0);
     }
 }
