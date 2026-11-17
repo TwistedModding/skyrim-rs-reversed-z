@@ -533,12 +533,26 @@ fn camera_constants() -> [f32; 4] {
     let far = skyrim::render::depth_shift_far();
     let scale = if near > 0.0 { near / VANILLA_NEAR } else { 1.0 };
     let a_near = -projection[14];
-    let a_less_one = if far > 0.0 {
-        a_near / far
+    [
+        scale,
+        a_less_one(projection[10], a_near, far),
+        a_near,
+        projection[15],
+    ]
+}
+
+/// A - 1 of a projection whose z scale is `a`: A near / far, which keeps the digits `a - 1` has
+/// lost, where the cached far is this projection's. The camera's far is not always the cached one
+/// (an interior at a lowered near: 4,002 against 707,680), and then every precise twin would sit
+/// off the depth the projection gives by the difference.
+fn a_less_one(a: f32, a_near: f32, far: f32) -> f32 {
+    let rounded = a - 1.0;
+    let precise = a_near / far;
+    if far > 0.0 && (precise - rounded).abs() <= 2.0 * f32::EPSILON {
+        precise
     } else {
-        projection[10] - 1.0
-    };
-    [scale, a_less_one, a_near, projection[15]]
+        rounded
+    }
 }
 
 pub(crate) fn create_vertex_constants(device: &ID3D11Device) -> Result<(), String> {
@@ -1666,6 +1680,16 @@ mod tests {
         DXGI_FORMAT_R32G8X24_TYPELESS, DXGI_SAMPLE_DESC,
     };
     use windows::core::s;
+
+    #[test]
+    fn a_less_one_follows_the_projection_over_a_far_that_is_not_its_own() {
+        let projection = |near: f32, far: f32| (far / (far - near), far / (far - near) * near);
+        let (a, a_near) = projection(15.0, 353_840.0);
+        assert_eq!(super::a_less_one(a, a_near, 353_840.0), a_near / 353_840.0);
+        let (a, a_near) = projection(2.0, 4_002.0);
+        assert_eq!(super::a_less_one(a, a_near, 707_680.0), a - 1.0);
+        assert_eq!(super::a_less_one(a, a_near, 0.0), a - 1.0);
+    }
 
     /// CPU time per draw sent through the hooks with a world target bound, against the same draws
     /// with no hooks, and of a depth copy refreshed at a reader's bind. `cargo test --release -p reversed-z per_draw_cost -- --ignored --nocapture`
