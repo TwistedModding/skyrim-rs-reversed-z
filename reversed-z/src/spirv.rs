@@ -5,8 +5,9 @@
 //! The mirrored twin of a SPIR-V vertex shader: before every return of the vertex entry point,
 //! the position's z is replaced. Precisely, from w and the projection's z row: A near - (A - 1) w,
 //! with A near read as `-CameraViewProj[2][3]` from the frame block the shader reaches through its
-//! resource heap (the projection's own constant, bit for bit), A - 1 as A near / far, and the LOD
-//! land's far push carried over scaled by near / 15. Otherwise, plainly, z = w - z. The position is
+//! resource heap (the projection's own constant, bit for bit), A - 1 as A near / far where that
+//! agrees with the block's own `CameraProj[2][2]` - 1 and as the latter where the far is not this
+//! camera's, and the LOD land's far push carried over scaled by near / 15. Otherwise, plainly, z = w - z. The position is
 //! the output decorated `BuiltIn Position`, either a variable or a member of a block.
 
 use std::collections::{HashMap, HashSet};
@@ -14,6 +15,7 @@ use std::collections::{HashMap, HashSet};
 const OP_EXT_INST_IMPORT: u16 = 11;
 const OP_EXT_INST: u16 = 12;
 const OP_ENTRY_POINT: u16 = 15;
+const OP_TYPE_BOOL: u16 = 20;
 const OP_TYPE_INT: u16 = 21;
 const OP_TYPE_FLOAT: u16 = 22;
 const OP_TYPE_VECTOR: u16 = 23;
@@ -36,6 +38,8 @@ const OP_FNEGATE: u16 = 127;
 const OP_FADD: u16 = 129;
 const OP_FSUB: u16 = 131;
 const OP_FMUL: u16 = 133;
+const OP_SELECT: u16 = 169;
+const OP_F_ORD_LESS_THAN_EQUAL: u16 = 188;
 const OP_LABEL: u16 = 248;
 const OP_RETURN: u16 = 253;
 const MODEL_VERTEX: u32 = 0;
@@ -48,6 +52,8 @@ const MAGIC: u32 = 0x0723_0203;
 const GLSL_FCLAMP: u32 = 43;
 /// `FrameBuffer::CameraViewProj` sits at byte 128 of the frame block (`packoffset(c8)`).
 const VIEW_PROJECTION_OFFSET: u32 = 128;
+/// `FrameBuffer::CameraProj` sits at byte 64 (`packoffset(c4)`).
+const PROJECTION_OFFSET: u32 = 64;
 /// The engine's far push: z += 0.5 saturate((z - 70000) / 10000), carried over by near / 15.
 const PUSH_START: f32 = 70_000.0;
 const PUSH_SLOPE: f32 = 0.0001;
@@ -96,9 +102,11 @@ fn word(code: &[u32], ins: &Instruction, n: usize) -> Option<u32> {
 }
 
 /// Where the shader reads the frame block's view-projection: the heap variable, its index (a
-/// constant or a value of the entry's first block), the member's index constant and its type.
+/// constant or a value of the entry's first block), the member's index constant and its type,
+/// and the block's member that is the projection.
 struct Source {
     variable: u32,
+    projection: Option<u32>,
     index: Option<u32>,
     member: u32,
     int: u32,
@@ -119,6 +127,8 @@ struct Module {
     runtime_arrays: HashMap<u32, u32>,
     structs: HashMap<u32, Vec<u32>>,
     view_projection_blocks: HashMap<u32, u32>,
+    projection_blocks: HashMap<u32, u32>,
+    bool: Option<u32>,
     constants: HashMap<u32, (u32, u32)>,
     outputs: Vec<(u32, u32)>,
     uniforms: Vec<(u32, u32)>,
@@ -154,6 +164,12 @@ fn gather(code: &[u32], ins: &[Instruction]) -> Module {
                     m.view_projection_blocks.insert(s, member);
                 }
             }
+            OP_MEMBER_DECORATE if w(3) == Some(OFFSET) && w(4) == Some(PROJECTION_OFFSET) => {
+                if let (Some(s), Some(member)) = (w(1), w(2)) {
+                    m.projection_blocks.insert(s, member);
+                }
+            }
+            OP_TYPE_BOOL => m.bool = w(1),
             OP_TYPE_FLOAT if w(2) == Some(32) => m.float = w(1),
             OP_TYPE_INT if w(2) == Some(32) && m.int.is_none() => m.int = w(1),
             OP_TYPE_VECTOR if w(3) == Some(4) && w(2) == m.float => m.vector = w(1),
@@ -248,6 +264,9 @@ fn source(code: &[u32], ins: &[Instruction], m: &Module, usable: &HashSet<u32>) 
         let Some((_, member)) = blocks.iter().find(|(s, _)| *s == block) else {
             continue;
         };
+        let projection = m.projection_blocks.get(&block).copied().filter(|member| {
+            m.structs.get(&block).and_then(|members| members.get(*member as usize)) == Some(&matrix)
+        });
         if index.is_some_and(|id| !m.constants.contains_key(&id) && !usable.contains(&id)) {
             continue;
         }
@@ -257,6 +276,7 @@ fn source(code: &[u32], ins: &[Instruction], m: &Module, usable: &HashSet<u32>) 
                 None => {
                     return Some(Source {
                         variable,
+                        projection,
                         index,
                         member: *m
                             .constants
@@ -277,6 +297,7 @@ fn source(code: &[u32], ins: &[Instruction], m: &Module, usable: &HashSet<u32>) 
         }
         return Some(Source {
             variable,
+            projection,
             index,
             member: member_index,
             int: *int,
@@ -322,6 +343,15 @@ struct Precise {
     row: u32,
     column: u32,
     floats: [u32; 7],
+    checked: Option<Checked>,
+}
+
+/// What checks A near / far against the block's projection: the projection's member index
+/// constant, the bool type and the squared tolerance, two float steps as on the D3D11 path.
+struct Checked {
+    member: u32,
+    bool: u32,
+    tolerance: u32,
 }
 
 /// The twin, or `None` when the shader has no vertex entry point writing a position. With `far`
@@ -403,12 +433,22 @@ pub(crate) fn mirrored(code: &[u32], far: Option<f32>) -> Option<Vec<u32>> {
             1.0,
         ]
         .map(|value| out.constant(float, value.to_bits()));
+        let checked = source.projection.map(|member| Checked {
+            member: existing(source.int, member).unwrap_or_else(|| out.constant(source.int, member)),
+            bool: module.bool.unwrap_or_else(|| {
+                let id = out.id();
+                out.emit(&[opcode(OP_TYPE_BOOL, 2), id]);
+                id
+            }),
+            tolerance: out.constant(float, (2.0 * f32::EPSILON).powi(2).to_bits()),
+        });
         Precise {
             source,
             pointer,
             row,
             column,
             floats,
+            checked,
         }
     });
 
@@ -441,17 +481,39 @@ pub(crate) fn mirrored(code: &[u32], far: Option<f32>) -> Option<Vec<u32>> {
                 let flipped = match &precise {
                     Some(p) => {
                         let [inv_far, inv_near, start, slope, height, zero, one] = p.floats;
-                        let chain = out.id();
-                        let mut words = vec![0, p.pointer, chain, p.source.variable];
-                        words.extend(p.source.index);
-                        words.extend([p.source.member, p.row, p.column]);
-                        words[0] = opcode(OP_ACCESS_CHAIN, words.len() as u32);
-                        out.emit(&words);
-                        let negated = out.id();
-                        out.emit(&[opcode(OP_LOAD, 4), float, negated, chain]);
+                        let mut element = |member: u32, column: u32| {
+                            let chain = out.id();
+                            let mut words = vec![0, p.pointer, chain, p.source.variable];
+                            words.extend(p.source.index);
+                            words.extend([member, p.row, column]);
+                            words[0] = opcode(OP_ACCESS_CHAIN, words.len() as u32);
+                            out.emit(&words);
+                            let loaded = out.id();
+                            out.emit(&[opcode(OP_LOAD, 4), float, loaded, chain]);
+                            loaded
+                        };
+                        let negated = element(p.source.member, p.column);
+                        let a = p.checked.as_ref().map(|c| element(c.member, p.row));
                         let a_near = out.id();
                         out.emit(&[opcode(OP_FNEGATE, 4), float, a_near, negated]);
-                        let a_less_one = out.binary(OP_FMUL, float, a_near, inv_far);
+                        let mut a_less_one = out.binary(OP_FMUL, float, a_near, inv_far);
+                        if let (Some(c), Some(a)) = (&p.checked, a) {
+                            let rounded = out.binary(OP_FSUB, float, a, one);
+                            let apart = out.binary(OP_FSUB, float, a_less_one, rounded);
+                            let squared = out.binary(OP_FMUL, float, apart, apart);
+                            let agrees =
+                                out.binary(OP_F_ORD_LESS_THAN_EQUAL, c.bool, squared, c.tolerance);
+                            let chosen = out.id();
+                            out.emit(&[
+                                opcode(OP_SELECT, 6),
+                                float,
+                                chosen,
+                                agrees,
+                                a_less_one,
+                                rounded,
+                            ]);
+                            a_less_one = chosen;
+                        }
                         let scaled_w = out.binary(OP_FMUL, float, a_less_one, w);
                         let base = out.binary(OP_FSUB, float, a_near, scaled_w);
                         match module.glsl {
@@ -523,6 +585,7 @@ mod tests {
             c.extend([opcode(OP_DECORATE, 4), 11, BUILTIN, POSITION]);
         }
         c.extend([opcode(OP_MEMBER_DECORATE, 5), 20, 1, OFFSET, VIEW_PROJECTION_OFFSET]);
+        c.extend([opcode(OP_MEMBER_DECORATE, 5), 20, 2, OFFSET, PROJECTION_OFFSET]);
         c.extend([opcode(OP_TYPE_VOID, 2), 1]);
         c.extend([opcode(OP_TYPE_FUNCTION, 3), 2, 1]);
         c.extend([opcode(OP_TYPE_FLOAT, 3), 3, 32]);
@@ -536,7 +599,7 @@ mod tests {
             c.extend([opcode(OP_CONSTANT, 4), 3, 31, PUSH_START.to_bits()]);
         }
         c.extend([opcode(OP_CONSTANT_COMPOSITE, 7), 4, 7, 6, 6, 6, 6]);
-        c.extend([opcode(OP_TYPE_STRUCT, 4), 20, 4, 21]);
+        c.extend([opcode(OP_TYPE_STRUCT, 5), 20, 4, 21, 21]);
         c.extend([opcode(OP_TYPE_RUNTIME_ARRAY, 3), 22, 20]);
         c.extend([opcode(OP_TYPE_POINTER, 4), 23, STORAGE_UNIFORM, 22]);
         c.extend([opcode(OP_TYPE_POINTER, 4), 24, STORAGE_UNIFORM, 20]);
@@ -619,6 +682,31 @@ mod tests {
         assert!(ops(&twin).contains(&OP_EXT_INST));
         let plain = mirrored(&module(false, true, true), None).unwrap();
         assert!(!ops(&plain).contains(&OP_FNEGATE));
+    }
+
+    #[test]
+    fn the_far_is_checked_against_the_blocks_projection() {
+        let mut without = module(false, true, false);
+        let decoration = [opcode(OP_MEMBER_DECORATE, 5), 20, 2, OFFSET, PROJECTION_OFFSET];
+        let at = without.windows(5).position(|w| w == decoration).unwrap();
+        without.drain(at..at + 5);
+        let unchecked = mirrored(&without, Some(350_000.0)).unwrap();
+        assert!(!ops(&unchecked).contains(&OP_SELECT));
+        let twin = mirrored(&module(false, true, false), Some(350_000.0)).unwrap();
+        let ins = instructions(&twin).unwrap();
+        // CameraProj[2][2], after CameraViewProj[2][3]
+        let chain = ins.iter().filter(|i| i.op == OP_ACCESS_CHAIN).nth(2).unwrap();
+        let two = twin[chain.at + chain.len - 1];
+        assert_eq!(twin[chain.at + chain.len - 2], two);
+        let member = twin[chain.at + chain.len - 3];
+        assert!(twin.windows(4).any(|w| w == [opcode(OP_CONSTANT, 4), 13, member, 2]));
+        assert!(twin.windows(4).any(|w| w == [opcode(OP_CONSTANT, 4), 13, two, 2]));
+        let select = ins.iter().find(|i| i.op == OP_SELECT).unwrap();
+        let bool = ins.iter().find(|i| i.op == OP_TYPE_BOOL).unwrap();
+        let compare = ins.iter().find(|i| i.op == OP_F_ORD_LESS_THAN_EQUAL).unwrap();
+        assert_eq!(twin[compare.at + 1], twin[bool.at + 1]);
+        assert_eq!(twin[select.at + 3], twin[compare.at + 2]);
+        assert!(bool.at < ins.iter().find(|i| i.op == OP_FUNCTION).unwrap().at);
     }
 
     #[test]

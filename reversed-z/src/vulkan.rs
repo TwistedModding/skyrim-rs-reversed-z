@@ -562,7 +562,8 @@ struct DynamicStates {
     info: vk::PipelineDynamicStateCreateInfo<'static>,
 }
 
-/// The far plane the precise endings are made for; twins are not remade when it changes.
+/// The far plane the precise endings are made for; twins are not remade when it changes, and
+/// take the frame block's own projection where it is not that camera's.
 fn far() -> Option<f32> {
     let far = skyrim::render::depth_shift_far();
     (far > 0.0).then_some(far)
