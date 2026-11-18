@@ -178,9 +178,26 @@ hooks! {
 static IMMEDIATE: AtomicUsize = AtomicUsize::new(0);
 /// A world depth view is bound and the calls sent to the context are mirrored.
 static BOUND: AtomicBool = AtomicBool::new(false);
-static LAST_DEPTH_STATE: AtomicUsize = AtomicUsize::new(0);
+/// The state the engine set, held as the context would hold it, and the address of what was sent
+/// for it: its twin while mirrored.
+struct Set<S> {
+    state: Option<S>,
+    sent: usize,
+}
+
+impl<S: Interface> Set<S> {
+    const fn none() -> Self {
+        Self { state: None, sent: 0 }
+    }
+
+    fn raw(&self) -> *mut c_void {
+        self.state.as_ref().map_or(core::ptr::null_mut(), Interface::as_raw)
+    }
+}
+
+static LAST_DEPTH_STATE: Mutex<Set<ID3D11DepthStencilState>> = Mutex::new(Set::none());
 static LAST_STENCIL_REF: AtomicU32 = AtomicU32::new(0);
-static LAST_RASTER: AtomicUsize = AtomicUsize::new(0);
+static LAST_RASTER: Mutex<Set<ID3D11RasterizerState>> = Mutex::new(Set::none());
 static LAST_VIEWPORTS: Mutex<Vec<D3D11_VIEWPORT>> = Mutex::new(Vec::new());
 static LAST_VERTEX_SHADER: Mutex<Option<ID3D11VertexShader>> = Mutex::new(None);
 static LAST_PIXEL_SHADER: Mutex<Option<ID3D11PixelShader>> = Mutex::new(None);
@@ -222,9 +239,26 @@ impl Hasher for PointerHasher {
 
 pub(crate) type PointerMap<V> = HashMap<usize, V, BuildHasherDefault<PointerHasher>>;
 
-static MIRRORED_DEPTH: Mutex<Option<PointerMap<usize>>> = Mutex::new(None);
-static MIRRORED_RASTER: Mutex<Option<PointerMap<usize>>> = Mutex::new(None);
-static DEPTH_MODES: Mutex<Option<PointerMap<(bool, bool)>>> = Mutex::new(None);
+/// A depth state's modes and its mirrored twin, made the first time it is sent mirrored. The entry
+/// holds the state: the context holds the twin in its place, so a state its owner released would
+/// be freed and the next one made at its address would be taken for it.
+struct DepthState {
+    state: Option<ID3D11DepthStencilState>,
+    tests: bool,
+    writes: bool,
+    twin: Option<ID3D11DepthStencilState>,
+}
+
+/// A rasterizer state held with its twin: itself where it has no depth bias.
+struct RasterState {
+    _state: ID3D11RasterizerState,
+    twin: ID3D11RasterizerState,
+}
+
+static DEPTH_STATES: Mutex<Option<PointerMap<DepthState>>> = Mutex::new(None);
+static RASTER_STATES: Mutex<Option<PointerMap<RasterState>>> = Mutex::new(None);
+/// Cached states past this many are released and read again; D3D11 keeps 4,096 of a kind alive.
+const STATE_LIMIT: usize = 1024;
 struct VertexConstants {
     buffer: ID3D11Buffer,
     sent: [u32; 4],
@@ -410,23 +444,34 @@ fn bind(context: *mut c_void, view: *mut c_void) {
         let context = unsafe { ID3D11DeviceContext::from_raw_borrowed(&context) }.unwrap();
         crate::copy::ensure(context, resource);
     }
+    send_depth_state(context, &mut LAST_DEPTH_STATE.lock().unwrap());
+    send_raster_and_viewports(context);
+}
+
+/// Sends the depth state the engine last set, or its twin while mirrored.
+fn send_depth_state(context: *mut c_void, last: &mut Set<ID3D11DepthStencilState>) {
+    let sent = depth_state(last.raw());
+    last.sent = sent as usize;
+    unsafe { original(&SET_DEPTH_STATE)(context, sent, LAST_STENCIL_REF.load(Ordering::Relaxed)) };
+}
+
+fn send_raster(context: *mut c_void, last: &mut Set<ID3D11RasterizerState>) {
+    let sent = raster(last.raw());
+    last.sent = sent as usize;
+    unsafe { original(&SET_RASTER)(context, sent) };
+}
+
+/// Sends the rasterizer state and the viewports again once the mirrored state has flipped.
+fn send_raster_and_viewports(context: *mut c_void) {
+    send_raster(context, &mut LAST_RASTER.lock().unwrap());
+    let viewports = viewports(&LAST_VIEWPORTS.lock().unwrap());
     unsafe {
-        original(&SET_DEPTH_STATE)(
-            context,
-            depth_state(LAST_DEPTH_STATE.load(Ordering::Relaxed) as *mut c_void),
-            LAST_STENCIL_REF.load(Ordering::Relaxed),
-        );
-        original(&SET_RASTER)(
-            context,
-            raster(LAST_RASTER.load(Ordering::Relaxed) as *mut c_void),
-        );
-        let viewports = viewports(&LAST_VIEWPORTS.lock().unwrap());
         original(&SET_VIEWPORTS)(
             context,
             u32::try_from(viewports.len()).unwrap_or(0),
             viewports.as_ptr(),
         );
-    }
+    };
 }
 
 /// Sends `stages` the engine's shader, or its twin while a depth-tested world view is bound. Done
@@ -670,6 +715,10 @@ pub(crate) fn release_push_scale() {
     LAST_PIXEL_SHADER.lock().unwrap().take();
     LAST_DOMAIN_SHADER.lock().unwrap().take();
     LAST_DEPTH_VIEW.lock().unwrap().take();
+    *LAST_DEPTH_STATE.lock().unwrap() = Set::none();
+    *LAST_RASTER.lock().unwrap() = Set::none();
+    DEPTH_STATES.lock().unwrap().take();
+    RASTER_STATES.lock().unwrap().take();
 }
 
 /// Runs `f` with no output targets bound, past the bind bookkeeping, and binds them again after.
@@ -779,35 +828,26 @@ unsafe extern "system" fn set_depth_state(
     stencil_ref: u32,
 ) {
     immediate_only!(SET_DEPTH_STATE, context, state, stencil_ref);
-    LAST_DEPTH_STATE.store(state as usize, Ordering::Relaxed);
     LAST_STENCIL_REF.store(stencil_ref, Ordering::Relaxed);
     let (tests, writes) = depth_mode(state);
     let changed = DEPTH_TESTS.swap(tests, Ordering::Relaxed) != tests;
     WRITES.store(writes, Ordering::Relaxed);
-    unsafe { original(&SET_DEPTH_STATE)(context, depth_state(state), stencil_ref) };
+    {
+        let mut last = LAST_DEPTH_STATE.lock().unwrap();
+        last.state = unsafe { ID3D11DepthStencilState::from_raw_borrowed(&state) }.cloned();
+        send_depth_state(context, &mut last);
+    }
     if changed && BOUND.load(Ordering::Relaxed) {
         resend(context, VERTEX | DOMAIN | PIXEL);
-        unsafe {
-            original(&SET_RASTER)(
-                context,
-                raster(LAST_RASTER.load(Ordering::Relaxed) as *mut c_void),
-            );
-        };
-        let viewports = viewports(&LAST_VIEWPORTS.lock().unwrap());
-        unsafe {
-            original(&SET_VIEWPORTS)(
-                context,
-                u32::try_from(viewports.len()).unwrap(),
-                viewports.as_ptr(),
-            );
-        };
+        send_raster_and_viewports(context);
     }
 }
 
 unsafe extern "system" fn set_raster(context: *mut c_void, state: *mut c_void) {
     immediate_only!(SET_RASTER, context, state);
-    LAST_RASTER.store(state as usize, Ordering::Relaxed);
-    unsafe { original(&SET_RASTER)(context, raster(state)) };
+    let mut last = LAST_RASTER.lock().unwrap();
+    last.state = unsafe { ID3D11RasterizerState::from_raw_borrowed(&state) }.cloned();
+    send_raster(context, &mut last);
 }
 
 unsafe extern "system" fn set_viewports(
@@ -991,29 +1031,18 @@ shader_getter!(
 
 /// Hands a state getter's caller the state it set when the bound one is that state's twin, so a
 /// caller that compares or restores what it read sees its own state.
-fn logical_state(
-    cache: &Mutex<Option<PointerMap<usize>>>,
-    last: &AtomicUsize,
-    out: *mut *mut c_void,
-) {
+fn logical_state<S: Interface>(last: &Mutex<Set<S>>, out: *mut *mut c_void) {
     if out.is_null() {
         return;
     }
     let bound = unsafe { *out };
-    let logical = last.load(Ordering::Relaxed);
-    let sent = cache
-        .lock()
-        .unwrap()
-        .as_ref()
-        .and_then(|c| c.get(&logical).copied());
-    if bound.is_null() || bound as usize == logical || sent != Some(bound as usize) {
+    let last = last.lock().unwrap();
+    if bound.is_null() || bound == last.raw() || bound as usize != last.sent {
         return;
     }
-    let logical = logical as *mut c_void;
     unsafe {
         drop(IUnknown::from_raw(bound));
-        *out = IUnknown::from_raw_borrowed(&logical)
-            .map_or(core::ptr::null_mut(), |state| state.clone().into_raw());
+        *out = last.state.clone().map_or(core::ptr::null_mut(), Interface::into_raw);
     }
 }
 
@@ -1024,13 +1053,13 @@ unsafe extern "system" fn get_depth_state(
 ) {
     immediate_only!(GET_DEPTH_STATE, context, state, stencil_ref);
     unsafe { original(&GET_DEPTH_STATE)(context, state, stencil_ref) };
-    logical_state(&MIRRORED_DEPTH, &LAST_DEPTH_STATE, state);
+    logical_state(&LAST_DEPTH_STATE, state);
 }
 
 unsafe extern "system" fn get_raster(context: *mut c_void, state: *mut *mut c_void) {
     immediate_only!(GET_RASTER, context, state);
     unsafe { original(&GET_RASTER)(context, state) };
-    logical_state(&MIRRORED_RASTER, &LAST_RASTER, state);
+    logical_state(&LAST_RASTER, state);
 }
 
 unsafe extern "system" fn get_viewports(
@@ -1218,6 +1247,81 @@ pub(crate) fn test_state_readback(
     unsafe { context.ClearState() };
 }
 
+/// States made, set and released one after another: each is mirrored for what it is, also where
+/// it lands on the address of one released before it.
+#[cfg(test)]
+pub(crate) fn test_released_states(
+    device: &ID3D11Device,
+    context: &ID3D11DeviceContext,
+    depth: &ID3D11DepthStencilView,
+) {
+    use windows::Win32::Graphics::Direct3D11::{
+        D3D11_COMPARISON_ALWAYS, D3D11_COMPARISON_GREATER_EQUAL, D3D11_CULL_BACK, D3D11_CULL_FRONT,
+        D3D11_DEPTH_STENCILOP_DESC, D3D11_DEPTH_WRITE_MASK_ZERO, D3D11_FILL_SOLID,
+        D3D11_STENCIL_OP_KEEP,
+    };
+    crate::copy::mark(&unsafe { depth.GetResource() }.unwrap(), true);
+    unsafe { context.OMSetRenderTargets(None, depth) };
+    let face = D3D11_DEPTH_STENCILOP_DESC {
+        StencilFailOp: D3D11_STENCIL_OP_KEEP,
+        StencilDepthFailOp: D3D11_STENCIL_OP_KEEP,
+        StencilPassOp: D3D11_STENCIL_OP_KEEP,
+        StencilFunc: D3D11_COMPARISON_ALWAYS,
+    };
+    for i in 0..3000u32 {
+        let odd = i & 1 != 0;
+        let [read_mask, write_mask, ..] = (i >> 1).to_le_bytes();
+        let desc = D3D11_DEPTH_STENCIL_DESC {
+            DepthEnable: true.into(),
+            DepthWriteMask: if odd { D3D11_DEPTH_WRITE_MASK_ZERO } else { D3D11_DEPTH_WRITE_MASK_ALL },
+            DepthFunc: if odd { D3D11_COMPARISON_GREATER_EQUAL } else { D3D11_COMPARISON_LESS },
+            StencilEnable: true.into(),
+            StencilReadMask: read_mask,
+            StencilWriteMask: write_mask,
+            FrontFace: face,
+            BackFace: face,
+        };
+        let mut state = None;
+        unsafe { device.CreateDepthStencilState(&raw const desc, Some(&raw mut state)) }.unwrap();
+        unsafe { context.OMSetDepthStencilState(state.as_ref(), 0) };
+        drop(state);
+        let raster_desc = D3D11_RASTERIZER_DESC {
+            FillMode: D3D11_FILL_SOLID,
+            CullMode: if odd { D3D11_CULL_FRONT } else { D3D11_CULL_BACK },
+            DepthBias: 1 + i.cast_signed(),
+            ..Default::default()
+        };
+        let mut state = None;
+        unsafe { device.CreateRasterizerState(&raw const raster_desc, Some(&raw mut state)) }.unwrap();
+        unsafe { context.RSSetState(state.as_ref()) };
+        drop(state);
+        let (mut bound, mut stencil_ref, mut raster) = (core::ptr::null_mut(), 0, core::ptr::null_mut());
+        unsafe {
+            original(&GET_DEPTH_STATE)(context.as_raw(), &raw mut bound, &raw mut stencil_ref);
+            original(&GET_RASTER)(context.as_raw(), &raw mut raster);
+        }
+        let (bound, raster) = unsafe {
+            (ID3D11DepthStencilState::from_raw(bound), ID3D11RasterizerState::from_raw(raster))
+        };
+        let (mut sent, mut sent_raster) = Default::default();
+        unsafe {
+            bound.GetDesc(&raw mut sent);
+            raster.GetDesc(&raw mut sent_raster);
+        }
+        assert_eq!(
+            (sent.DepthFunc, sent.DepthWriteMask, sent.StencilReadMask, sent.StencilWriteMask),
+            (mirrored_func(desc.DepthFunc), desc.DepthWriteMask, desc.StencilReadMask, desc.StencilWriteMask),
+            "depth state {i}"
+        );
+        assert_eq!(
+            (sent_raster.CullMode, sent_raster.DepthBias),
+            (raster_desc.CullMode, -raster_desc.DepthBias),
+            "rasterizer state {i}"
+        );
+    }
+    unsafe { context.ClearState() };
+}
+
 macro_rules! resource_hook {
     ($name:ident, $slot:ident, $stage:ident) => {
         unsafe extern "system" fn $name(
@@ -1376,9 +1480,9 @@ unsafe extern "system" fn clear_state(context: *mut c_void) {
     LAST_VERTEX_SHADER.lock().unwrap().take();
     LAST_PIXEL_SHADER.lock().unwrap().take();
     LAST_DOMAIN_SHADER.lock().unwrap().take();
-    LAST_DEPTH_STATE.store(0, Ordering::Relaxed);
+    *LAST_DEPTH_STATE.lock().unwrap() = Set::none();
     LAST_STENCIL_REF.store(0, Ordering::Relaxed);
-    LAST_RASTER.store(0, Ordering::Relaxed);
+    *LAST_RASTER.lock().unwrap() = Set::none();
     LAST_VIEWPORTS.lock().unwrap().clear();
     VERTEX_CONSTANT_SLOT.store(u32::MAX, Ordering::Relaxed);
     if let Some(constants) = VERTEX_CONSTANTS.lock().unwrap().as_mut() {
@@ -1565,22 +1669,44 @@ fn vertex_shader(shader: *mut c_void) -> *mut c_void {
     })
 }
 
+/// A depth state's description, the default state's for none.
+fn depth_desc(state: Option<&ID3D11DepthStencilState>) -> D3D11_DEPTH_STENCIL_DESC {
+    let mut desc = D3D11_DEPTH_STENCIL_DESC {
+        DepthEnable: true.into(),
+        DepthWriteMask: D3D11_DEPTH_WRITE_MASK_ALL,
+        DepthFunc: D3D11_COMPARISON_LESS,
+        ..Default::default()
+    };
+    if let Some(state) = state {
+        unsafe { state.GetDesc(&raw mut desc) };
+    }
+    desc
+}
+
+/// The cached entry of depth state `state`, read from the state the first time it is seen.
+fn with_depth_state<R>(state: *mut c_void, f: impl FnOnce(&mut DepthState) -> R) -> R {
+    let mut cache = DEPTH_STATES.lock().unwrap();
+    let cache = cache.get_or_insert_with(PointerMap::default);
+    if let Some(entry) = cache.get_mut(&(state as usize)) {
+        return f(entry);
+    }
+    if cache.len() >= STATE_LIMIT {
+        cache.clear();
+    }
+    let held = unsafe { ID3D11DepthStencilState::from_raw_borrowed(&state) }.cloned();
+    let desc = depth_desc(held.as_ref());
+    let tests = desc.DepthEnable.as_bool();
+    f(cache.entry(state as usize).or_insert(DepthState {
+        state: held,
+        tests,
+        writes: tests && desc.DepthWriteMask == D3D11_DEPTH_WRITE_MASK_ALL,
+        twin: None,
+    }))
+}
+
+/// Whether a depth state tests depth, and whether it writes it.
 fn depth_mode(state: *mut c_void) -> (bool, bool) {
-    let mut cache = DEPTH_MODES.lock().unwrap();
-    *cache
-        .get_or_insert_with(PointerMap::default)
-        .entry(state as usize)
-        .or_insert_with(|| {
-            let Some(s) = (unsafe { ID3D11DepthStencilState::from_raw_borrowed(&state) }) else {
-                return (true, true);
-            };
-            let mut desc = D3D11_DEPTH_STENCIL_DESC::default();
-            unsafe { s.GetDesc(&raw mut desc) };
-            (
-                desc.DepthEnable.as_bool(),
-                desc.DepthEnable.as_bool() && desc.DepthWriteMask == D3D11_DEPTH_WRITE_MASK_ALL,
-            )
-        })
+    with_depth_state(state, |entry| (entry.tests, entry.writes))
 }
 
 fn mirrored_func(f: D3D11_COMPARISON_FUNC) -> D3D11_COMPARISON_FUNC {
@@ -1593,25 +1719,24 @@ fn mirrored_func(f: D3D11_COMPARISON_FUNC) -> D3D11_COMPARISON_FUNC {
     }
 }
 
-/// The state to send: the engine's, or its mirrored twin while a world view is bound.
+/// The state to send: the engine's, or its mirrored twin while a world view is bound. The state
+/// itself where the twin cannot be made.
 fn depth_state(state: *mut c_void) -> *mut c_void {
     if !mirrored() {
         return state;
     }
-    twin(&MIRRORED_DEPTH, state, |device| {
-        let mut desc = D3D11_DEPTH_STENCIL_DESC {
-            DepthEnable: true.into(),
-            DepthWriteMask: D3D11_DEPTH_WRITE_MASK_ALL,
-            DepthFunc: D3D11_COMPARISON_LESS,
-            ..Default::default()
-        };
-        if let Some(s) = unsafe { ID3D11DepthStencilState::from_raw_borrowed(&state) } {
-            unsafe { s.GetDesc(&raw mut desc) };
+    with_depth_state(state, |entry| {
+        if entry.twin.is_none() {
+            let mut desc = depth_desc(entry.state.as_ref());
+            desc.DepthFunc = mirrored_func(desc.DepthFunc);
+            entry.twin = device().and_then(|device| {
+                let mut twin = None;
+                unsafe { device.CreateDepthStencilState(&raw const desc, Some(&raw mut twin)) }
+                    .ok()?;
+                twin
+            });
         }
-        desc.DepthFunc = mirrored_func(desc.DepthFunc);
-        let mut out = None;
-        unsafe { device.CreateDepthStencilState(&raw const desc, Some(&raw mut out)) }.ok()?;
-        out.map(Interface::into_raw)
+        entry.twin.as_ref().map_or(state, Interface::as_raw)
     })
 }
 
@@ -1621,46 +1746,43 @@ fn raster(state: *mut c_void) -> *mut c_void {
     else {
         return state;
     };
-    twin(&MIRRORED_RASTER, state, |device| {
-        let mut desc = D3D11_RASTERIZER_DESC::default();
-        unsafe { s.GetDesc(&raw mut desc) };
-        if desc.DepthBias == 0 && desc.SlopeScaledDepthBias == 0.0 {
-            return Some(s.as_raw());
-        }
+    let mut cache = RASTER_STATES.lock().unwrap();
+    let cache = cache.get_or_insert_with(PointerMap::default);
+    if let Some(entry) = cache.get(&(state as usize)) {
+        return entry.twin.as_raw();
+    }
+    let mut desc = D3D11_RASTERIZER_DESC::default();
+    unsafe { s.GetDesc(&raw mut desc) };
+    let twin = if desc.DepthBias == 0 && desc.SlopeScaledDepthBias == 0.0 {
+        Some(s.clone())
+    } else {
         desc.DepthBias = -desc.DepthBias;
         desc.SlopeScaledDepthBias = -desc.SlopeScaledDepthBias;
         desc.DepthBiasClamp = -desc.DepthBiasClamp;
-        let mut out = None;
-        unsafe { device.CreateRasterizerState(&raw const desc, Some(&raw mut out)) }.ok()?;
-        out.map(Interface::into_raw)
-    })
-}
-
-/// The cached twin of `state`, made once by `build`; the state itself when it cannot be made.
-fn twin(
-    cache: &Mutex<Option<PointerMap<usize>>>,
-    state: *mut c_void,
-    build: impl FnOnce(&ID3D11Device) -> Option<*mut c_void>,
-) -> *mut c_void {
-    let mut cache = cache.lock().unwrap();
-    let cache = cache.get_or_insert_with(PointerMap::default);
-    if let Some(t) = cache.get(&(state as usize)) {
-        return *t as *mut c_void;
+        device().and_then(|device| {
+            let mut twin = None;
+            unsafe { device.CreateRasterizerState(&raw const desc, Some(&raw mut twin)) }.ok()?;
+            twin
+        })
+    };
+    let Some(twin) = twin else {
+        return state;
+    };
+    if cache.len() >= STATE_LIMIT {
+        cache.clear();
     }
-    let made = device().and_then(|d| build(&d)).unwrap_or(state);
-    cache.insert(state as usize, made as usize);
-    made
+    let sent = twin.as_raw();
+    cache.insert(state as usize, RasterState { _state: s.clone(), twin });
+    sent
 }
 
 pub(crate) fn counters() -> String {
-    let twins =
-        |c: &Mutex<Option<PointerMap<usize>>>| c.lock().unwrap().as_ref().map_or(0, HashMap::len);
     format!(
-        "{}{}, depth state twins {}, raster twins {}, world depth clears {}, {}",
+        "{}{}, depth states {}, raster states {}, world depth clears {}, {}",
         if BELOW_WRAPPER.load(Ordering::Relaxed) { "below a wrapper, " } else { "" },
         crate::shader::counters(),
-        twins(&MIRRORED_DEPTH),
-        twins(&MIRRORED_RASTER),
+        DEPTH_STATES.lock().unwrap().as_ref().map_or(0, HashMap::len),
+        RASTER_STATES.lock().unwrap().as_ref().map_or(0, HashMap::len),
         CLEARS.load(Ordering::Relaxed),
         crate::copy::counters()
     )

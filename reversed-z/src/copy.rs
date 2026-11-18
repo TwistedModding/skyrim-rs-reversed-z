@@ -1041,6 +1041,7 @@ pub(crate) mod tests {
         partial_copy(device, context, depth_desc, &input);
         crate::context::test_shader_readback(device, context, &depth_view);
         crate::context::test_state_readback(device, context, &depth_view);
+        crate::context::test_released_states(device, context, &depth_view);
         deferred_refresh(context, &depth.cast().unwrap(), &depth_view, &original);
         release();
         crate::context::remove();
